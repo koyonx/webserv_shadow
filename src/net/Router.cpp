@@ -1,0 +1,202 @@
+#include "webserv/net/Router.hpp"
+
+#include "webserv/StringUtil.hpp"
+
+namespace webserv {
+
+RouteMatch::RouteMatch()
+	: server(NULL),
+	  location(NULL),
+	  normalizedPath(),
+	  errorStatus(0),
+	  errorMessage(NULL)
+{}
+
+Router::Router(const webserv::config::Config &cfg) : m_cfg(cfg) {}
+
+// -------- path normalization --------
+
+bool Router::normalizePath(const std::string &in, std::string &out)
+{
+	out.clear();
+	if (in.empty()) {
+		out = "/";
+		return true;
+	}
+	bool leadingSlash  = (in[0] == '/');
+	bool trailingSlash = (in.size() > 1) && (in[in.size() - 1] == '/');
+	if (!leadingSlash) {
+		// Origin-form always starts with '/'; anything else is treated
+		// as if it did so we can still evaluate normalization safely.
+		leadingSlash = true;
+	}
+
+	std::vector<std::string> segs;
+	std::string              cur;
+	for (std::size_t i = 0; i <= in.size(); ++i) {
+		char c = (i < in.size()) ? in[i] : '/';
+		if (c == '/') {
+			if (cur.empty()) {
+				// consecutive '/' or leading '/' — skip
+			} else if (cur == ".") {
+				// no-op
+			} else if (cur == "..") {
+				if (segs.empty()) {
+					return false;   // escapes root
+				}
+				segs.pop_back();
+			} else {
+				segs.push_back(cur);
+			}
+			cur.clear();
+		} else {
+			cur += c;
+		}
+	}
+
+	out = "/";
+	for (std::size_t i = 0; i < segs.size(); ++i) {
+		if (i > 0) out += '/';
+		out += segs[i];
+	}
+	if (!segs.empty() && out.size() > 1 && trailingSlash) {
+		out += '/';
+	}
+	return true;
+}
+
+// -------- prefix matching --------
+
+bool Router::locationPrefixMatches(const std::string &prefix,
+                                   const std::string &path)
+{
+	if (prefix.empty()) return false;
+	if (prefix == "/")  return true;
+	if (path.size() < prefix.size()) return false;
+	if (path.compare(0, prefix.size(), prefix) != 0) return false;
+	if (path.size() == prefix.size()) return true;
+	// Boundary check: prefix "/api" must not match "/apix".
+	if (prefix[prefix.size() - 1] == '/') return true;
+	return path[prefix.size()] == '/';
+}
+
+// -------- server selection --------
+
+std::string Router::hostHeaderName(const std::string &raw)
+{
+	// "example.com:8080" -> "example.com". IPv6 forms like "[::1]:80"
+	// keep their brackets; we split on the last ':' only when what
+	// follows is all-digit, to avoid corrupting IPv6 authorities.
+	std::string s = strutil::trim(raw);
+	std::string::size_type colon = s.rfind(':');
+	if (colon != std::string::npos) {
+		bool allDigits = colon + 1 < s.size();
+		for (std::size_t i = colon + 1; allDigits && i < s.size(); ++i) {
+			if (s[i] < '0' || s[i] > '9') { allDigits = false; break; }
+		}
+		if (allDigits) s = s.substr(0, colon);
+	}
+	return strutil::toLower(s);
+}
+
+static bool serverListenMatches(const webserv::config::ServerConfig &srv,
+                                const webserv::config::Listen       &origin)
+{
+	for (std::size_t i = 0; i < srv.listens.size(); ++i) {
+		const webserv::config::Listen &l = srv.listens[i];
+		if (l.port != origin.port) continue;
+		// Wildcard host on either side matches everything.
+		if (l.host == "0.0.0.0" || origin.host == "0.0.0.0") return true;
+		if (l.host == origin.host) return true;
+	}
+	return false;
+}
+
+static bool serverNameMatches(const std::string &pattern,
+                              const std::string &host)
+{
+	if (pattern.empty() || host.empty()) return false;
+	if (strutil::iequals(pattern, host)) return true;
+	// Prefix wildcard: "*.example.com"
+	if (pattern.size() > 2 && pattern[0] == '*' && pattern[1] == '.') {
+		std::string suffix = pattern.substr(1); // ".example.com"
+		if (host.size() >= suffix.size()) {
+			std::string tail = host.substr(host.size() - suffix.size());
+			if (strutil::iequals(tail, suffix)) return true;
+		}
+	}
+	return false;
+}
+
+const webserv::config::ServerConfig *
+Router::selectServer(const webserv::config::Listen &origin,
+                     const std::string             &host) const
+{
+	const webserv::config::ServerConfig *firstOnListen = NULL;
+	for (std::size_t i = 0; i < m_cfg.servers.size(); ++i) {
+		const webserv::config::ServerConfig &s = m_cfg.servers[i];
+		if (!serverListenMatches(s, origin)) continue;
+		if (firstOnListen == NULL) firstOnListen = &s;
+		// Try exact / wildcard server_name match.
+		for (std::size_t j = 0; j < s.serverNames.size(); ++j) {
+			if (serverNameMatches(s.serverNames[j], host)) {
+				return &s;
+			}
+		}
+	}
+	return firstOnListen;    // default server on this listener
+}
+
+// -------- location selection --------
+
+const webserv::config::LocationConfig *
+Router::matchLocation(const std::vector<webserv::config::LocationConfig> &locs,
+                      const std::string                                  &path) const
+{
+	const webserv::config::LocationConfig *best = NULL;
+	for (std::size_t i = 0; i < locs.size(); ++i) {
+		const webserv::config::LocationConfig &loc = locs[i];
+		if (!locationPrefixMatches(loc.path, path)) continue;
+		const webserv::config::LocationConfig *inner = NULL;
+		if (!loc.locations.empty()) {
+			inner = matchLocation(loc.locations, path);
+		}
+		const webserv::config::LocationConfig *candidate =
+			(inner != NULL) ? inner : &loc;
+		if (best == NULL || candidate->path.size() > best->path.size()) {
+			best = candidate;
+		}
+	}
+	return best;
+}
+
+// -------- entry point --------
+
+RouteMatch Router::match(const webserv::config::Listen &origin,
+                         const webserv::http::Request  &req) const
+{
+	RouteMatch m;
+
+	// Path normalization (with .. resolution).
+	std::string src = req.path.empty() ? std::string("/") : req.path;
+	if (!normalizePath(src, m.normalizedPath)) {
+		m.errorStatus  = 400;
+		m.errorMessage = "path escapes root after normalization";
+		return m;
+	}
+
+	// Host header selection.
+	std::string host = hostHeaderName(req.authority);
+	m.server = selectServer(origin, host);
+	if (m.server == NULL) {
+		m.errorStatus  = 404;
+		m.errorMessage = "no server matches the connection listener";
+		return m;
+	}
+
+	// Location selection (nested).
+	m.location = matchLocation(m.server->locations, m.normalizedPath);
+	return m;
+}
+
+} // namespace webserv

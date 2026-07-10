@@ -10,6 +10,8 @@
 
 namespace webserv {
 
+class Router;
+
 // Combines: IAcceptSink (creates Connections for each accepted fd)
 //         + IConnectionOwner (holds ownership of Connection objects)
 //         + IHandler (periodic sweep to reap finished connections)
@@ -28,8 +30,9 @@ class ConnectionSpawner
 	  public IHandler
 {
 public:
-	ConnectionSpawner(long idleTimeoutMs,
-	                  long sweepIntervalMs);
+	ConnectionSpawner(long          idleTimeoutMs,
+	                  long          sweepIntervalMs,
+	                  const Router *router = NULL);
 	virtual ~ConnectionSpawner();
 
 	// Register the spawner as a timer-only handler and kick off the
@@ -60,6 +63,7 @@ private:
 
 	long                       m_idleMs;
 	long                       m_sweepMs;
+	const Router              *m_router;
 	bool                       m_armed;
 	std::set<Connection *>     m_live;
 	std::vector<Connection *>  m_dead;
