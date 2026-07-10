@@ -1,11 +1,10 @@
 #include "webserv/net/Connection.hpp"
 
 #include "webserv/Log.hpp"
-#include "webserv/StringUtil.hpp"
 #include "webserv/core/PollLoop.hpp"
+#include "webserv/http/Response.hpp"
 
 #include <poll.h>
-#include <sstream>
 #include <unistd.h>
 
 namespace webserv {
@@ -43,61 +42,22 @@ short Connection::wantEvents() const
 bool                 Connection::isDone() const { return m_done; }
 Connection::State    Connection::state()  const { return m_state; }
 
-static const char *reasonPhrase(int status)
-{
-	switch (status) {
-		case 200: return "OK";
-		case 204: return "No Content";
-		case 301: return "Moved Permanently";
-		case 302: return "Found";
-		case 400: return "Bad Request";
-		case 403: return "Forbidden";
-		case 404: return "Not Found";
-		case 405: return "Method Not Allowed";
-		case 408: return "Request Timeout";
-		case 411: return "Length Required";
-		case 413: return "Payload Too Large";
-		case 414: return "URI Too Long";
-		case 415: return "Unsupported Media Type";
-		case 431: return "Request Header Fields Too Large";
-		case 500: return "Internal Server Error";
-		case 501: return "Not Implemented";
-		case 502: return "Bad Gateway";
-		case 503: return "Service Unavailable";
-		case 504: return "Gateway Timeout";
-		case 505: return "HTTP Version Not Supported";
-	}
-	return "Error";
-}
-
 void Connection::generateStubResponse()
 {
+	// Skeleton response. Real handlers arrive in Phase 4.
 	const std::string body = "webserv connection FSM skeleton\n";
-	std::ostringstream oss;
-	oss << "HTTP/1.1 200 OK\r\n"
-	    << "Content-Type: text/plain\r\n"
-	    << "Content-Length: " << body.size() << "\r\n"
-	    << "Connection: close\r\n"
-	    << "\r\n"
-	    << body;
-	m_writeBuf = oss.str();
+	webserv::http::Response r;
+	r.setStatus(200);
+	r.setKeepAlive(m_parser.request().keepAlive);
+	r.setBody(body);
+	m_writeBuf = r.serialize();
 	m_writePos = 0;
 }
 
 void Connection::generateErrorResponse(int status)
 {
-	std::ostringstream bodyOss;
-	bodyOss << status << " " << reasonPhrase(status) << "\n";
-	std::string body = bodyOss.str();
-
-	std::ostringstream oss;
-	oss << "HTTP/1.1 " << status << " " << reasonPhrase(status) << "\r\n"
-	    << "Content-Type: text/plain; charset=utf-8\r\n"
-	    << "Content-Length: " << body.size() << "\r\n"
-	    << "Connection: close\r\n"
-	    << "\r\n"
-	    << body;
-	m_writeBuf = oss.str();
+	webserv::http::Response r = webserv::http::Response::makeError(status);
+	m_writeBuf = r.serialize();
 	m_writePos = 0;
 }
 
@@ -113,6 +73,40 @@ void Connection::finish(PollLoop &loop)
 	m_owner.notifyDone(this);
 }
 
+// Drive the parser until it can't make progress with the current
+// buffer; when it completes, generate a response and flip to write
+// state. Called both from onReadable() after read(), and after a
+// keep-alive reset when leftover pipelined bytes remain.
+static void driveParser(webserv::http::RequestParser &parser,
+                        std::string                  &readBuf,
+                        bool                         &parseError,
+                        int                          &errStatus,
+                        const char *                 &errMsg,
+                        bool                         &complete)
+{
+	parseError = false;
+	complete   = false;
+	while (!readBuf.empty()) {
+		std::size_t                consumed = 0;
+		webserv::http::ParseResult res =
+			parser.feed(readBuf.data(), readBuf.size(), consumed);
+		if (consumed > 0) {
+			readBuf.erase(0, consumed);
+		}
+		if (res == webserv::http::kParseError) {
+			parseError = true;
+			errStatus  = parser.errorStatus();
+			errMsg     = parser.errorMessage();
+			return;
+		}
+		if (res == webserv::http::kParseNeedMore) {
+			return;
+		}
+		complete = true;
+		return;
+	}
+}
+
 void Connection::onReadable(PollLoop &loop)
 {
 	char    buf[4096];
@@ -123,27 +117,21 @@ void Connection::onReadable(PollLoop &loop)
 	}
 	m_readBuf.append(buf, static_cast<std::size_t>(r));
 
-	// Drain the read buffer into the parser as far as it will go.
-	while (m_state == kReadingRequest && !m_readBuf.empty()) {
-		std::size_t             consumed = 0;
-		webserv::http::ParseResult res =
-			m_parser.feed(m_readBuf.data(), m_readBuf.size(), consumed);
-		if (consumed > 0) {
-			m_readBuf.erase(0, consumed);
-		}
-		if (res == webserv::http::kParseError) {
-			int status = m_parser.errorStatus();
-			LOG_WARN("Connection fd=" << m_fd.get()
-			         << " parse error " << status << ": "
-			         << (m_parser.errorMessage() ? m_parser.errorMessage() : ""));
-			generateErrorResponse(status);
-			m_state = kWritingResponse;
-			break;
-		}
-		if (res == webserv::http::kParseNeedMore) {
-			break;
-		}
-		// kParseComplete: full request (line + headers + body) consumed.
+	if (m_state != kReadingRequest) {
+		return;
+	}
+	bool parseError = false, complete = false;
+	int  errStatus  = 500;
+	const char *errMsg = NULL;
+	driveParser(m_parser, m_readBuf, parseError, errStatus, errMsg, complete);
+	if (parseError) {
+		LOG_WARN("Connection fd=" << m_fd.get() << " parse error "
+		         << errStatus << ": " << (errMsg ? errMsg : ""));
+		generateErrorResponse(errStatus);
+		m_state = kWritingResponse;
+		return;
+	}
+	if (complete) {
 		const webserv::http::Request &req = m_parser.request();
 		LOG_INFO("Connection fd=" << m_fd.get() << " request: "
 		         << req.method << " "
@@ -157,7 +145,7 @@ void Connection::onReadable(PollLoop &loop)
 		             (" host=" + req.authority)));
 		generateStubResponse();
 		m_state = kWritingResponse;
-		break;
+		return;
 	}
 	loop.setDeadline(this, m_idleMs);
 }
@@ -168,21 +156,58 @@ void Connection::onWritable(PollLoop &loop)
 		return;
 	}
 	std::size_t remaining = m_writeBuf.size() - m_writePos;
-	if (remaining == 0) {
+	if (remaining > 0) {
+		ssize_t w = ::write(m_fd.get(),
+		                    m_writeBuf.data() + m_writePos,
+		                    remaining);
+		if (w <= 0) {
+			finish(loop);
+			return;
+		}
+		m_writePos += static_cast<std::size_t>(w);
+	}
+	if (m_writePos < m_writeBuf.size()) {
+		loop.setDeadline(this, m_idleMs);
+		return;
+	}
+
+	// Full response written. Decide whether to close or keep-alive.
+	bool keepAlive = m_parser.request().keepAlive
+	              && m_parser.errorStatus() == 0;
+	if (!keepAlive) {
 		finish(loop);
 		return;
 	}
-	ssize_t w = ::write(m_fd.get(),
-	                    m_writeBuf.data() + m_writePos,
-	                    remaining);
-	if (w <= 0) {
-		finish(loop);
-		return;
-	}
-	m_writePos += static_cast<std::size_t>(w);
-	if (m_writePos >= m_writeBuf.size()) {
-		finish(loop);
-		return;
+
+	// Keep-alive: reset for the next request. Leftover bytes in
+	// m_readBuf may already contain the next pipelined request; drive
+	// the parser immediately so we do not miss it.
+	m_parser.reset();
+	m_writeBuf.clear();
+	m_writePos = 0;
+	m_state    = kReadingRequest;
+
+	if (!m_readBuf.empty()) {
+		bool parseError = false, complete = false;
+		int  errStatus  = 500;
+		const char *errMsg = NULL;
+		driveParser(m_parser, m_readBuf, parseError, errStatus, errMsg, complete);
+		if (parseError) {
+			LOG_WARN("Connection fd=" << m_fd.get()
+			         << " parse error " << errStatus << ": "
+			         << (errMsg ? errMsg : ""));
+			generateErrorResponse(errStatus);
+			m_state = kWritingResponse;
+		} else if (complete) {
+			const webserv::http::Request &req = m_parser.request();
+			LOG_INFO("Connection fd=" << m_fd.get()
+			         << " (pipelined) request: "
+			         << req.method << " "
+			         << (req.path.empty() ? req.target : req.path)
+			         << " HTTP/" << req.version.major << "." << req.version.minor);
+			generateStubResponse();
+			m_state = kWritingResponse;
+		}
 	}
 	loop.setDeadline(this, m_idleMs);
 }
