@@ -20,34 +20,6 @@ namespace {
 
 const std::size_t kMaxStaticFile = 10UL * 1024UL * 1024UL;   // 10 MiB
 
-bool methodAllowed(const std::string                                   &method,
-                   const std::vector<std::string>                     &allowed)
-{
-	if (allowed.empty()) {
-		// No explicit list -> permit the three supported methods.
-		return method == "GET"    || method == "POST" || method == "DELETE"
-		    || method == "HEAD";
-	}
-	for (std::size_t i = 0; i < allowed.size(); ++i) {
-		if (allowed[i] == method)                       return true;
-		if (method == "HEAD" && allowed[i] == "GET")    return true;
-	}
-	return false;
-}
-
-std::string allowHeaderFromMethods(const std::vector<std::string> &allowed)
-{
-	if (allowed.empty()) {
-		return "GET, POST, DELETE";
-	}
-	std::string out;
-	for (std::size_t i = 0; i < allowed.size(); ++i) {
-		if (i > 0) out += ", ";
-		out += allowed[i];
-	}
-	return out;
-}
-
 std::string joinPath(const std::string &root, const std::string &rel)
 {
 	if (root.empty()) return rel;
@@ -135,45 +107,8 @@ void serveStatic(const webserv::http::Request &req,
 {
 	response.setKeepAlive(req.keepAlive);
 
-	// A router-level failure at this point still owns error_page
-	// resolution when the server itself was identified (the reordered
-	// Router::match keeps server != NULL even for path traversal 400).
-	if (match.errorStatus != 0 || match.server == NULL) {
-		writeErrorBody(response,
-		               match.errorStatus ? match.errorStatus : 500,
-		               &match);
-		return;
-	}
-
-	// Method policy: prefer location's list; fall back to server-wide.
-	const std::vector<std::string> *allowed = NULL;
-	if (match.location != NULL && !match.location->allowedMethods.empty()) {
-		allowed = &match.location->allowedMethods;
-	}
-	std::vector<std::string> empty;
-	if (allowed == NULL) allowed = &empty;
-	if (!methodAllowed(req.method, *allowed)) {
-		response.setHeader("Allow", allowHeaderFromMethods(*allowed));
-		writeErrorBody(response, 405, &match);
-		return;
-	}
-
-	// Location may declare `return CODE [URL];` — honor that first.
-	if (match.location != NULL && match.location->hasReturn) {
-		int code = match.location->ret.code;
-		response.setStatus(code);
-		response.setContentType("text/plain; charset=utf-8");
-		if (!match.location->ret.url.empty()) {
-			response.setHeader("Location", match.location->ret.url);
-		}
-		std::string body;
-		body += strutil::toStr(static_cast<long>(code));
-		body += " ";
-		body += webserv::http::reasonPhrase(code);
-		body += "\n";
-		response.setBody(body);
-		return;
-	}
+	// Dispatch has already applied allowed_methods and `return`
+	// short-circuits, so we can go straight to file resolution.
 
 	// Assemble filesystem path from the location's root (or the server's
 	// root if the location didn't set one).
