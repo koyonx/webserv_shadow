@@ -31,7 +31,11 @@ Connection::Connection(int                            cfd,
 	  m_done(false),
 	  m_parser(),
 	  m_cgi(NULL)
-{}
+{
+	if (m_router != NULL) {
+		m_parser.setMaxBodySize(m_router->maxBodyCap());
+	}
+}
 
 Connection::~Connection()
 {
