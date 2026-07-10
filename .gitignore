@@ -1,6 +1,6 @@
 # Build artifacts
 obj/
-webserv
+/webserv
 *.o
 *.d
 *.a
