@@ -2,7 +2,7 @@
 
 #include "webserv/Log.hpp"
 #include "webserv/core/PollLoop.hpp"
-#include "webserv/handler/StaticHandler.hpp"
+#include "webserv/handler/Dispatch.hpp"
 #include "webserv/http/Response.hpp"
 #include "webserv/net/Router.hpp"
 
@@ -62,12 +62,7 @@ void Connection::generateStubResponse()
 	}
 
 	RouteMatch m = m_router->match(m_origin, req);
-	if (m.errorStatus != 0) {
-		generateErrorResponse(m.errorStatus);
-		return;
-	}
-
-	handler::serveStatic(req, m, r);
+	handler::dispatch(req, m, r);
 	m_writeBuf = r.serialize();
 	m_writePos = 0;
 }
