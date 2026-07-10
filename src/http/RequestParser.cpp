@@ -1,6 +1,10 @@
 #include "webserv/http/RequestParser.hpp"
 
+#include "webserv/StringUtil.hpp"
+
+#include <climits>
 #include <cstddef>
+#include <sstream>
 
 namespace webserv {
 namespace http {
@@ -9,7 +13,6 @@ namespace http {
 
 static bool isTChar(unsigned char c)
 {
-	// RFC 7230 §3.2.6 tchar.
 	if (('A' <= c && c <= 'Z') || ('a' <= c && c <= 'z') || ('0' <= c && c <= '9')) {
 		return true;
 	}
@@ -22,20 +25,26 @@ static bool isTChar(unsigned char c)
 	return false;
 }
 
-// RFC 3986 unreserved and reserved chars we allow *raw* in request-target.
-// SP and CTLs are excluded; "<>{}|\^`" are RFC 3986 delimiters that MUST
-// be percent-encoded in a URI. High bytes (>= 0x80) must be encoded too;
-// we reject them raw for strictness.
 static bool isValidTargetChar(unsigned char c)
 {
-	if (c < 0x21)  return false;   // CTL and SP
-	if (c > 0x7E)  return false;   // DEL and high bytes
+	if (c < 0x21)  return false;
+	if (c > 0x7E)  return false;
 	switch (c) {
 		case '<': case '>': case '{': case '}':
 		case '|': case '\\': case '^': case '`': case '"':
 			return false;
 	}
 	return true;
+}
+
+// field-vchar (RFC 7230 §3.2.6). Allows obs-text (0x80..0xFF) for
+// backwards compat with older clients.
+static bool isFieldValueByte(unsigned char c)
+{
+	if (c == '\t' || c == ' ') return true;
+	if (c >= 0x21 && c <= 0x7E) return true;
+	if (c >= 0x80)              return true;   // obs-text
+	return false;
 }
 
 static bool hexDigit(char c, int &out)
@@ -55,17 +64,11 @@ static bool percentDecode(const std::string &in,
 	for (std::size_t i = 0; i < in.size();) {
 		char c = in[i];
 		if (c == '%') {
-			if (i + 2 >= in.size()) {
-				return false;
-			}
+			if (i + 2 >= in.size()) return false;
 			int h1 = 0, h2 = 0;
-			if (!hexDigit(in[i + 1], h1) || !hexDigit(in[i + 2], h2)) {
-				return false;
-			}
+			if (!hexDigit(in[i + 1], h1) || !hexDigit(in[i + 2], h2)) return false;
 			unsigned char b = static_cast<unsigned char>((h1 << 4) | h2);
-			if (rejectNul && b == 0) {
-				return false;
-			}
+			if (rejectNul && b == 0) return false;
 			out += static_cast<char>(b);
 			i   += 3;
 		} else {
@@ -90,15 +93,12 @@ static void splitPathQuery(const std::string &target,
 	}
 }
 
-// absolute-form: scheme "://" authority path-abempty [ "?" query ]
 static bool parseAbsoluteForm(const std::string &target,
                               std::string       &authority,
                               std::string       &pathQuery)
 {
 	std::string::size_type ss = target.find("://");
-	if (ss == std::string::npos || ss == 0) {
-		return false;
-	}
+	if (ss == std::string::npos || ss == 0) return false;
 	std::string scheme = target.substr(0, ss);
 	for (std::size_t i = 0; i < scheme.size(); ++i) {
 		char c = scheme[i];
@@ -106,9 +106,7 @@ static bool parseAbsoluteForm(const std::string &target,
 			(('a' <= c && c <= 'z') || ('A' <= c && c <= 'Z')) ||
 			(i > 0 && ('0' <= c && c <= '9')) ||
 			(i > 0 && (c == '+' || c == '-' || c == '.'));
-		if (!ok) {
-			return false;
-		}
+		if (!ok) return false;
 	}
 	std::string             rest  = target.substr(ss + 3);
 	std::string::size_type  slash = rest.find('/');
@@ -128,8 +126,15 @@ RequestParser::RequestParser()
 	: m_phase(kPhaseRequestLine),
 	  m_req(),
 	  m_line(),
-	  m_headerBuf(),
+	  m_lineLast(false),
 	  m_maxLine(8192),
+	  m_maxHeaderBytes(32 * 1024),
+	  m_maxHeaderCount(100),
+	  m_headerBytesSoFar(0),
+	  m_headerCountSoFar(0),
+	  m_seenHost(false),
+	  m_seenContentLength(false),
+	  m_seenTransferEncoding(false),
 	  m_status(0),
 	  m_errmsg(NULL)
 {}
@@ -139,7 +144,12 @@ void RequestParser::reset()
 	m_phase = kPhaseRequestLine;
 	m_req.clear();
 	m_line.clear();
-	m_headerBuf.clear();
+	m_lineLast              = false;
+	m_headerBytesSoFar      = 0;
+	m_headerCountSoFar      = 0;
+	m_seenHost              = false;
+	m_seenContentLength     = false;
+	m_seenTransferEncoding  = false;
 	m_status = 0;
 	m_errmsg = NULL;
 }
@@ -148,6 +158,8 @@ const Request &RequestParser::request()      const { return m_req; }
 int            RequestParser::errorStatus()  const { return m_status; }
 const char    *RequestParser::errorMessage() const { return m_errmsg; }
 void           RequestParser::setMaxRequestLine(std::size_t b) { m_maxLine = b; }
+void           RequestParser::setMaxHeaderBytes(std::size_t b) { m_maxHeaderBytes = b; }
+void           RequestParser::setMaxHeaderCount(std::size_t n) { m_maxHeaderCount = n; }
 
 void RequestParser::setError(int status, const char *msg)
 {
@@ -171,22 +183,16 @@ ParseResult RequestParser::feed(const char *data,
 			ParseResult r = feedRequestLine(data + consumed, len - consumed, c);
 			consumed += c;
 			if (r != kParseNeedMore) return r;
-			if (m_phase != kPhaseHeadersStub) {
-				// Still in request line but need more bytes.
-				return kParseNeedMore;
-			}
-			// Fall through to headers stub in same call so we make
-			// progress on any leftover bytes in this feed.
+			if (m_phase != kPhaseHeaders) return kParseNeedMore;
 		}
-		if (m_phase == kPhaseHeadersStub) {
+		if (m_phase == kPhaseHeaders) {
 			std::size_t c = 0;
-			ParseResult r = feedHeadersStub(data + consumed, len - consumed, c);
+			ParseResult r = feedHeaders(data + consumed, len - consumed, c);
 			consumed += c;
 			if (r != kParseNeedMore) return r;
 			return kParseNeedMore;
 		}
 		if (consumed == before) {
-			// Guard against zero-progress loop.
 			return kParseNeedMore;
 		}
 	}
@@ -203,22 +209,17 @@ ParseResult RequestParser::feedRequestLine(const char *data,
 	while (consumed < len) {
 		char c = data[consumed++];
 		if (c == '\n') {
-			// Strip trailing '\r' if the line ended with CRLF.
 			if (!m_line.empty() && m_line[m_line.size() - 1] == '\r') {
 				m_line.erase(m_line.size() - 1);
 			}
 			if (m_line.empty()) {
-				// RFC 7230 §3.5: servers SHOULD ignore at least one
-				// leading empty line before the request-line.
-				continue;
+				continue;   // leading empty line permitted
 			}
-			if (!parseAccumulatedLine()) {
-				return kParseError;
-			}
-			m_phase = kPhaseHeadersStub;
+			if (!parseAccumulatedRequestLine()) return kParseError;
+			m_line.clear();
+			m_phase = kPhaseHeaders;
 			return kParseNeedMore;
 		}
-		// CTLs (except \r as line-terminator prefix) are invalid.
 		if (static_cast<unsigned char>(c) < 0x20 && c != '\r') {
 			setError(400, "control character in request line");
 			return kParseError;
@@ -236,18 +237,12 @@ ParseResult RequestParser::feedRequestLine(const char *data,
 	return kParseNeedMore;
 }
 
-bool RequestParser::parseAccumulatedLine()
+bool RequestParser::parseAccumulatedRequestLine()
 {
-	// Split "METHOD SP TARGET SP HTTP/n.n" — SP is one space, no tabs.
 	std::string::size_type sp1 = m_line.find(' ');
-	if (sp1 == std::string::npos) {
-		setError(400, "request-line missing SP after method"); return false;
-	}
+	if (sp1 == std::string::npos) { setError(400, "request-line missing SP after method"); return false; }
 	std::string::size_type sp2 = m_line.find(' ', sp1 + 1);
-	if (sp2 == std::string::npos) {
-		setError(400, "request-line missing SP after target"); return false;
-	}
-	// Reject a third SP (multiple SPs => malformed).
+	if (sp2 == std::string::npos) { setError(400, "request-line missing SP after target"); return false; }
 	if (m_line.find(' ', sp2 + 1) != std::string::npos) {
 		setError(400, "extra whitespace in request-line"); return false;
 	}
@@ -256,42 +251,27 @@ bool RequestParser::parseAccumulatedLine()
 	m_req.target = m_line.substr(sp1 + 1, sp2 - sp1 - 1);
 	std::string ver = m_line.substr(sp2 + 1);
 
-	// Method: 1*tchar
-	if (m_req.method.empty()) {
-		setError(400, "empty method"); return false;
-	}
+	if (m_req.method.empty()) { setError(400, "empty method"); return false; }
 	for (std::size_t i = 0; i < m_req.method.size(); ++i) {
 		if (!isTChar(static_cast<unsigned char>(m_req.method[i]))) {
-			setError(400, "invalid character in method");
-			return false;
+			setError(400, "invalid character in method"); return false;
 		}
 	}
 
-	// Target: character validity
-	if (m_req.target.empty()) {
-		setError(400, "empty request-target"); return false;
-	}
+	if (m_req.target.empty()) { setError(400, "empty request-target"); return false; }
 	for (std::size_t i = 0; i < m_req.target.size(); ++i) {
 		if (!isValidTargetChar(static_cast<unsigned char>(m_req.target[i]))) {
-			setError(400, "invalid character in request-target");
-			return false;
+			setError(400, "invalid character in request-target"); return false;
 		}
 	}
 
-	if (!parseRequestTarget()) {
-		return false;
-	}
-	if (!parseVersion(ver)) {
-		return false;
-	}
-	return true;
+	return parseRequestTarget() && parseVersion(ver);
 }
 
 bool RequestParser::parseRequestTarget()
 {
 	const std::string &t = m_req.target;
 
-	// asterisk-form: only for OPTIONS
 	if (t == "*") {
 		if (m_req.method != "OPTIONS") {
 			setError(400, "asterisk-form only allowed with OPTIONS");
@@ -302,44 +282,34 @@ bool RequestParser::parseRequestTarget()
 		return true;
 	}
 
-	// origin-form: absolute-path starts with '/'
 	if (t[0] == '/') {
 		std::string rawPath, rawQuery;
 		splitPathQuery(t, rawPath, rawQuery);
-		if (!percentDecode(rawPath, m_req.path, /*rejectNul=*/true)) {
-			setError(400, "invalid percent-encoding in path");
-			return false;
+		if (!percentDecode(rawPath, m_req.path, true)) {
+			setError(400, "invalid percent-encoding in path"); return false;
 		}
 		m_req.query = rawQuery;
 		return true;
 	}
 
-	// absolute-form: contains "://"
 	if (t.find("://") != std::string::npos) {
 		std::string authority, pathQuery;
 		if (!parseAbsoluteForm(t, authority, pathQuery)) {
-			setError(400, "malformed absolute-form URI");
-			return false;
+			setError(400, "malformed absolute-form URI"); return false;
 		}
 		m_req.authority = authority;
 		std::string rawPath, rawQuery;
 		splitPathQuery(pathQuery, rawPath, rawQuery);
-		if (rawPath.empty()) {
-			rawPath = "/";
-		}
+		if (rawPath.empty()) rawPath = "/";
 		if (!percentDecode(rawPath, m_req.path, true)) {
-			setError(400, "invalid percent-encoding in absolute-form path");
-			return false;
+			setError(400, "invalid percent-encoding in absolute-form path"); return false;
 		}
 		m_req.query = rawQuery;
 		return true;
 	}
 
-	// authority-form: only for CONNECT
 	if (m_req.method == "CONNECT") {
 		m_req.authority = t;
-		m_req.path.clear();
-		m_req.query.clear();
 		return true;
 	}
 
@@ -349,57 +319,206 @@ bool RequestParser::parseRequestTarget()
 
 bool RequestParser::parseVersion(const std::string &ver)
 {
-	// Strict form: "HTTP/<DIGIT>.<DIGIT>"
-	if (ver.size() != 8) {
-		setError(400, "HTTP-version must be exactly 8 chars"); return false;
-	}
+	if (ver.size() != 8) { setError(400, "HTTP-version must be exactly 8 chars"); return false; }
 	if (ver[0] != 'H' || ver[1] != 'T' || ver[2] != 'T' || ver[3] != 'P'
 	 || ver[4] != '/' || ver[6] != '.') {
 		setError(400, "malformed HTTP-version"); return false;
 	}
-	if (!('0' <= ver[5] && ver[5] <= '9')
-	 || !('0' <= ver[7] && ver[7] <= '9')) {
+	if (!('0' <= ver[5] && ver[5] <= '9') || !('0' <= ver[7] && ver[7] <= '9')) {
 		setError(400, "non-digit in HTTP-version"); return false;
 	}
 	m_req.version.major = ver[5] - '0';
 	m_req.version.minor = ver[7] - '0';
-
-	// We only accept HTTP/1.0 and HTTP/1.1.
 	if (m_req.version.major != 1
 	 || (m_req.version.minor != 0 && m_req.version.minor != 1)) {
-		setError(505, "HTTP version not supported");
-		return false;
+		setError(505, "HTTP version not supported"); return false;
 	}
 	return true;
 }
 
-// -------- headers stub (feat/11 replaces this) --------
+// -------- headers --------
 
-ParseResult RequestParser::feedHeadersStub(const char *data,
-                                           std::size_t len,
-                                           std::size_t &consumed)
+ParseResult RequestParser::feedHeaders(const char *data,
+                                       std::size_t len,
+                                       std::size_t &consumed)
 {
 	consumed = 0;
 	while (consumed < len) {
-		m_headerBuf += data[consumed++];
-		if (m_headerBuf.size() >= 4) {
-			if (m_headerBuf.compare(m_headerBuf.size() - 4, 4, "\r\n\r\n") == 0
-			 || (m_headerBuf.size() >= 2
-			  && m_headerBuf.compare(m_headerBuf.size() - 2, 2, "\n\n") == 0)) {
+		char c = data[consumed++];
+		if (c == '\n') {
+			if (!m_line.empty() && m_line[m_line.size() - 1] == '\r') {
+				m_line.erase(m_line.size() - 1);
+			}
+			if (m_line.empty()) {
+				// End of headers.
+				if (!finalizeHeaders()) return kParseError;
 				m_phase = kPhaseDone;
 				return kParseComplete;
 			}
-		} else if (m_headerBuf.size() >= 2
-		        && m_headerBuf.compare(m_headerBuf.size() - 2, 2, "\n\n") == 0) {
-			m_phase = kPhaseDone;
-			return kParseComplete;
+			// Reject obs-fold: line starting with SP/HTAB continues
+			// the previous field. RFC 7230 §3.2.4 says a server MUST
+			// respond with 400 (or otherwise reject) for obs-fold in
+			// any request field except within Content-Type multipart.
+			if (m_line[0] == ' ' || m_line[0] == '\t') {
+				setError(400, "obsolete line folding in headers");
+				return kParseError;
+			}
+			if (!parseHeaderLine(m_line)) return kParseError;
+			m_line.clear();
+			continue;
 		}
-		if (m_headerBuf.size() > 32 * 1024) {
-			setError(431, "headers too large");
-			return kParseError;
+		// Any octet is fine while accumulating; validation happens per
+		// line so we only flag structural bytes here.
+		m_line += c;
+		++m_headerBytesSoFar;
+		if (m_line.size() > m_maxLine) {
+			setError(431, "header line too long"); return kParseError;
+		}
+		if (m_headerBytesSoFar > m_maxHeaderBytes) {
+			setError(431, "total header bytes exceeded"); return kParseError;
 		}
 	}
 	return kParseNeedMore;
+}
+
+bool RequestParser::parseHeaderLine(const std::string &line)
+{
+	// name : OWS value OWS   (obs-fold rejected above)
+	std::string::size_type colon = line.find(':');
+	if (colon == std::string::npos) {
+		setError(400, "header missing ':'"); return false;
+	}
+	if (colon == 0) {
+		setError(400, "empty header name"); return false;
+	}
+
+	// name: tchar only, no whitespace before ':' (RFC 7230 §3.2.4)
+	for (std::size_t i = 0; i < colon; ++i) {
+		unsigned char c = static_cast<unsigned char>(line[i]);
+		if (!isTChar(c)) {
+			setError(400, "invalid character in header name"); return false;
+		}
+	}
+
+	std::string name = line.substr(0, colon);
+
+	// Extract value with OWS trimmed from both sides.
+	std::size_t vstart = colon + 1;
+	while (vstart < line.size() && (line[vstart] == ' ' || line[vstart] == '\t')) ++vstart;
+	std::size_t vend = line.size();
+	while (vend > vstart && (line[vend - 1] == ' ' || line[vend - 1] == '\t')) --vend;
+	std::string value = line.substr(vstart, vend - vstart);
+
+	// Validate value bytes (obs-text allowed).
+	for (std::size_t i = 0; i < value.size(); ++i) {
+		if (!isFieldValueByte(static_cast<unsigned char>(value[i]))) {
+			setError(400, "invalid byte in header value"); return false;
+		}
+	}
+
+	++m_headerCountSoFar;
+	if (m_headerCountSoFar > m_maxHeaderCount) {
+		setError(431, "too many header fields"); return false;
+	}
+
+	// Duplicate handling.
+	if (strutil::iequals(name, "Host")) {
+		if (m_seenHost) { setError(400, "duplicate Host header"); return false; }
+		m_seenHost = true;
+	}
+	if (strutil::iequals(name, "Content-Length")) {
+		if (m_seenContentLength) {
+			setError(400, "duplicate Content-Length header"); return false;
+		}
+		m_seenContentLength = true;
+	}
+	if (strutil::iequals(name, "Transfer-Encoding")) {
+		m_seenTransferEncoding = true;
+	}
+
+	// Insert or combine with ', ' (RFC 7230 §3.2.2, except Set-Cookie).
+	HeaderMap::iterator it = m_req.headers.find(name);
+	if (it == m_req.headers.end()) {
+		m_req.headers.insert(std::make_pair(name, value));
+	} else {
+		it->second += ", ";
+		it->second += value;
+	}
+	return true;
+}
+
+bool RequestParser::finalizeHeaders()
+{
+	// HTTP/1.1 requires exactly one Host header.
+	if (m_req.version == Version(1, 1) && !m_seenHost) {
+		setError(400, "HTTP/1.1 request missing Host header"); return false;
+	}
+
+	// If absolute-form was used, prefer its authority over Host.
+	if (!m_req.authority.empty() && m_seenHost) {
+		// Both provided; the request-target's authority takes priority
+		// per RFC 7230 §5.4. Nothing to change; both stay in Request.
+	} else if (m_req.authority.empty() && m_seenHost) {
+		m_req.authority = m_req.headers.find("Host")->second;
+	}
+
+	// Transfer-Encoding + Content-Length combination is forbidden.
+	if (m_seenTransferEncoding && m_seenContentLength) {
+		setError(400, "Content-Length and Transfer-Encoding are mutually exclusive");
+		return false;
+	}
+
+	// Transfer-Encoding: check chunked is last coding.
+	if (m_seenTransferEncoding) {
+		HeaderMap::const_iterator it = m_req.headers.find("Transfer-Encoding");
+		std::vector<std::string> codings = strutil::split(it->second, ',');
+		if (codings.empty()) {
+			setError(400, "empty Transfer-Encoding"); return false;
+		}
+		for (std::size_t i = 0; i < codings.size(); ++i) {
+			codings[i] = strutil::trim(codings[i]);
+		}
+		if (!strutil::iequals(codings.back(), "chunked")) {
+			setError(400, "Transfer-Encoding must end with 'chunked'"); return false;
+		}
+		for (std::size_t i = 0; i + 1 < codings.size(); ++i) {
+			if (strutil::iequals(codings[i], "chunked")) {
+				setError(400, "'chunked' may appear only as the final coding"); return false;
+			}
+		}
+		m_req.chunked = true;
+	}
+
+	// Content-Length: parse to non-negative integer.
+	if (m_seenContentLength) {
+		HeaderMap::const_iterator it = m_req.headers.find("Content-Length");
+		std::string v = strutil::trim(it->second);
+		if (v.empty()) {
+			setError(400, "empty Content-Length"); return false;
+		}
+		long n = 0;
+		if (!strutil::parseLong(v, n) || n < 0) {
+			setError(400, "invalid Content-Length"); return false;
+		}
+		m_req.contentLength = static_cast<std::size_t>(n);
+	}
+
+	// Connection: decide keep-alive.
+	//   HTTP/1.1 defaults to keep-alive unless "close" is present.
+	//   HTTP/1.0 defaults to close unless "keep-alive" is present.
+	bool keepAliveDefault = (m_req.version == Version(1, 1));
+	m_req.keepAlive = keepAliveDefault;
+	HeaderMap::const_iterator cIt = m_req.headers.find("Connection");
+	if (cIt != m_req.headers.end()) {
+		std::vector<std::string> tokens = strutil::split(cIt->second, ',');
+		for (std::size_t i = 0; i < tokens.size(); ++i) {
+			std::string tok = strutil::trim(tokens[i]);
+			if (strutil::iequals(tok, "close"))       m_req.keepAlive = false;
+			if (strutil::iequals(tok, "keep-alive"))  m_req.keepAlive = true;
+		}
+	}
+
+	return true;
 }
 
 } // namespace http
