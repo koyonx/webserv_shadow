@@ -1,0 +1,32 @@
+# Build artifacts
+obj/
+webserv
+*.o
+*.d
+*.a
+
+# 42 evaluators / large local binaries kept out of history
+testers/
+
+# OS junk
+.DS_Store
+Thumbs.db
+*Zone.Identifier
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Runtime data
+logs/
+*.log
+uploads/
+tmp/
+
+# Coverage / profiling (if we add later)
+*.gcno
+*.gcda
+*.gcov
