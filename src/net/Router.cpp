@@ -177,20 +177,21 @@ RouteMatch Router::match(const webserv::config::Listen &origin,
 {
 	RouteMatch m;
 
-	// Path normalization (with .. resolution).
-	std::string src = req.path.empty() ? std::string("/") : req.path;
-	if (!normalizePath(src, m.normalizedPath)) {
-		m.errorStatus  = 400;
-		m.errorMessage = "path escapes root after normalization";
-		return m;
-	}
-
-	// Host header selection.
+	// Server selection first, so error responses that fail path
+	// validation still know which server's error_page config applies.
 	std::string host = hostHeaderName(req.authority);
 	m.server = selectServer(origin, host);
 	if (m.server == NULL) {
 		m.errorStatus  = 404;
 		m.errorMessage = "no server matches the connection listener";
+		return m;
+	}
+
+	// Path normalization (with .. resolution).
+	std::string src = req.path.empty() ? std::string("/") : req.path;
+	if (!normalizePath(src, m.normalizedPath)) {
+		m.errorStatus  = 400;
+		m.errorMessage = "path escapes root after normalization";
 		return m;
 	}
 
