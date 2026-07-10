@@ -172,6 +172,30 @@ Router::matchLocation(const std::vector<webserv::config::LocationConfig> &locs,
 
 // -------- entry point --------
 
+static std::size_t maxInLocations(
+	const std::vector<webserv::config::LocationConfig> &locs)
+{
+	std::size_t best = 0;
+	for (std::size_t i = 0; i < locs.size(); ++i) {
+		if (locs[i].maxBodySize > best) best = locs[i].maxBodySize;
+		std::size_t nested = maxInLocations(locs[i].locations);
+		if (nested > best) best = nested;
+	}
+	return best;
+}
+
+std::size_t Router::maxBodyCap() const
+{
+	std::size_t best = 0;
+	for (std::size_t i = 0; i < m_cfg.servers.size(); ++i) {
+		const webserv::config::ServerConfig &s = m_cfg.servers[i];
+		if (s.maxBodySize > best) best = s.maxBodySize;
+		std::size_t nested = maxInLocations(s.locations);
+		if (nested > best) best = nested;
+	}
+	return (best > 0) ? best : (1024UL * 1024UL);
+}
+
 RouteMatch Router::match(const webserv::config::Listen &origin,
                          const webserv::http::Request  &req) const
 {

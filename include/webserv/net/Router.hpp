@@ -41,6 +41,11 @@ public:
 	// escape the root ("..") more times than it descended.
 	static bool normalizePath(const std::string &in, std::string &out);
 
+	// Largest client_max_body_size across the whole config. Connection
+	// uses this to size the RequestParser's cap so a legitimate upload
+	// against the biggest-configured location isn't rejected too early.
+	std::size_t maxBodyCap() const;
+
 	// Case-insensitive prefix match with a "/" boundary check.
 	// prefix == "/" matches every path. Otherwise the request path
 	// must equal prefix or start with prefix + "/".
