@@ -19,7 +19,9 @@ CgiProcess::CgiProcess(const std::string              &interpreter,
                        const std::string              &scriptWorkDir,
                        const std::vector<std::string> &env,
                        const std::string              &body,
-                       ICgiCallback                   &cb)
+                       ICgiCallback                   &cb,
+                       long                            totalTimeoutMs,
+                       long                            killEscalationMs)
 	: m_interp(interpreter),
 	  m_script(scriptPath),
 	  m_workDir(scriptWorkDir),
@@ -33,7 +35,10 @@ CgiProcess::CgiProcess(const std::string              &interpreter,
 	  m_out(NULL),
 	  m_stdinClosed(false),
 	  m_stdoutClosed(false),
-	  m_finished(false)
+	  m_finished(false),
+	  m_totalTimeoutMs(totalTimeoutMs),
+	  m_killEscalationMs(killEscalationMs),
+	  m_killState(0)
 {}
 
 CgiProcess::~CgiProcess()
@@ -132,8 +137,15 @@ void CgiProcess::spawn(PollLoop &loop)
 		loop.remove(m_in);
 	}
 
+	// Arm the total-runtime deadline on m_out; onDeadlineExpired
+	// escalates SIGTERM -> SIGKILL -> forced completion.
+	if (m_totalTimeoutMs > 0) {
+		loop.setDeadline(m_out, m_totalTimeoutMs);
+	}
+
 	LOG_INFO("cgi: spawned pid=" << m_pid
-	         << " " << m_interp << " " << m_script);
+	         << " " << m_interp << " " << m_script
+	         << " timeout=" << m_totalTimeoutMs << "ms");
 }
 
 void CgiProcess::abort(PollLoop &loop)
@@ -229,6 +241,37 @@ void CgiProcess::reapAndCallback(int status)
 	m_cb.onCgiComplete(status, m_output);
 }
 
+void CgiProcess::onDeadlineExpired(PollLoop &loop)
+{
+	if (m_finished || m_pid <= 0) return;
+	if (m_killState == 0) {
+		LOG_WARN("cgi: pid=" << m_pid << " runtime deadline hit -> SIGTERM");
+		::kill(m_pid, SIGTERM);
+		m_killState = 1;
+		loop.setDeadline(m_out, m_killEscalationMs);
+		return;
+	}
+	if (m_killState == 1) {
+		LOG_WARN("cgi: pid=" << m_pid << " still alive -> SIGKILL");
+		::kill(m_pid, SIGKILL);
+		m_killState = 2;
+		loop.setDeadline(m_out, m_killEscalationMs);
+		return;
+	}
+	// SIGKILL sent and still not done -> force finish; report as
+	// killed (status = -1) so Connection returns 504.
+	LOG_ERROR("cgi: pid=" << m_pid << " unresponsive after SIGKILL, forcing finish");
+	m_stdoutClosed = true;
+	if (m_out != NULL) {
+		m_out->closeFd();
+		loop.remove(m_out);
+	}
+	int st = 0;
+	::waitpid(m_pid, &st, WNOHANG);
+	m_pid = -1;
+	reapAndCallback(-1);
+}
+
 // ---------- StdinFd ----------
 
 CgiProcess::StdinFd::StdinFd(CgiProcess *o, int fd) : m_owner(o), m_fd(fd) {}
@@ -260,7 +303,7 @@ short CgiProcess::StdoutFd::wantEvents() const
 }
 void CgiProcess::StdoutFd::onReadable(PollLoop &loop) { m_owner->onStdoutReady(loop); }
 void CgiProcess::StdoutFd::onWritable(PollLoop &) {}
-void CgiProcess::StdoutFd::onTimeout(PollLoop &) {}
+void CgiProcess::StdoutFd::onTimeout(PollLoop &loop)  { m_owner->onDeadlineExpired(loop); }
 void CgiProcess::StdoutFd::closeFd() { m_fd.close(); }
 
 } // namespace cgi
