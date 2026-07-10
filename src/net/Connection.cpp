@@ -2,6 +2,7 @@
 
 #include "webserv/Log.hpp"
 #include "webserv/core/PollLoop.hpp"
+#include "webserv/handler/StaticHandler.hpp"
 #include "webserv/http/Response.hpp"
 #include "webserv/net/Router.hpp"
 
@@ -48,40 +49,25 @@ Connection::State    Connection::state()  const { return m_state; }
 void Connection::generateStubResponse()
 {
 	const webserv::http::Request &req = m_parser.request();
+	webserv::http::Response       r;
 
-	// Route the request if we have a Router configured. Feat/15 will
-	// turn a successful match into a real static-file response; here we
-	// only prove the routing chain.
-	std::string body = "webserv connection FSM skeleton\n";
-	int         status = 200;
-	if (m_router != NULL) {
-		RouteMatch m = m_router->match(m_origin, req);
-		if (m.errorStatus != 0) {
-			generateErrorResponse(m.errorStatus);
-			return;
-		}
-		std::string srvName = "(default)";
-		if (m.server != NULL && !m.server->serverNames.empty()) {
-			srvName = m.server->serverNames.front();
-		}
-		std::string locPath = (m.location != NULL) ? m.location->path
-		                                           : std::string("(server root)");
-		LOG_INFO("Connection fd=" << m_fd.get()
-		         << " routed: server=" << srvName
-		         << " location=" << locPath
-		         << " normPath=" << m.normalizedPath);
-		body  = "matched server_name=";
-		body += srvName;
-		body += " location=";
-		body += locPath;
-		body += " normalized=";
-		body += m.normalizedPath;
-		body += "\n";
+	if (m_router == NULL) {
+		// Legacy stub for --test-connection (no config loaded).
+		r.setStatus(200);
+		r.setKeepAlive(req.keepAlive);
+		r.setBody("webserv connection FSM skeleton\n");
+		m_writeBuf = r.serialize();
+		m_writePos = 0;
+		return;
 	}
-	webserv::http::Response r;
-	r.setStatus(status);
-	r.setKeepAlive(req.keepAlive);
-	r.setBody(body);
+
+	RouteMatch m = m_router->match(m_origin, req);
+	if (m.errorStatus != 0) {
+		generateErrorResponse(m.errorStatus);
+		return;
+	}
+
+	handler::serveStatic(req, m, r);
 	m_writeBuf = r.serialize();
 	m_writePos = 0;
 }

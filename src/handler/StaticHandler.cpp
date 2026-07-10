@@ -1,0 +1,261 @@
+#include "webserv/handler/StaticHandler.hpp"
+
+#include "webserv/Log.hpp"
+#include "webserv/StringUtil.hpp"
+#include "webserv/http/Mime.hpp"
+
+#include <cerrno>
+#include <cstddef>
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <unistd.h>
+
+namespace webserv {
+namespace handler {
+
+namespace {
+
+const std::size_t kMaxStaticFile = 10UL * 1024UL * 1024UL;   // 10 MiB
+
+bool methodAllowed(const std::string                                   &method,
+                   const std::vector<std::string>                     &allowed)
+{
+	if (allowed.empty()) {
+		// No explicit list -> permit the three supported methods.
+		return method == "GET"    || method == "POST" || method == "DELETE"
+		    || method == "HEAD";
+	}
+	for (std::size_t i = 0; i < allowed.size(); ++i) {
+		if (allowed[i] == method)                       return true;
+		if (method == "HEAD" && allowed[i] == "GET")    return true;
+	}
+	return false;
+}
+
+std::string allowHeaderFromMethods(const std::vector<std::string> &allowed)
+{
+	if (allowed.empty()) {
+		return "GET, POST, DELETE";
+	}
+	std::string out;
+	for (std::size_t i = 0; i < allowed.size(); ++i) {
+		if (i > 0) out += ", ";
+		out += allowed[i];
+	}
+	return out;
+}
+
+std::string joinPath(const std::string &root, const std::string &rel)
+{
+	if (root.empty()) return rel;
+	if (rel.empty())  return root;
+	bool rootEndsSlash = root[root.size() - 1] == '/';
+	bool relStartsSlash = rel[0] == '/';
+	if (rootEndsSlash && relStartsSlash)   return root + rel.substr(1);
+	if (!rootEndsSlash && !relStartsSlash) return root + "/" + rel;
+	return root + rel;
+}
+
+// Read the whole regular file at `path` into `out`, up to maxBytes.
+// Returns 0 on success, or a suggested HTTP status on failure.
+int readWholeFile(const std::string &path,
+                  std::size_t        maxBytes,
+                  std::string       &out)
+{
+	int fd = ::open(path.c_str(), O_RDONLY);
+	if (fd < 0) {
+		int err = errno;
+		if (err == ENOENT || err == ENOTDIR) return 404;
+		if (err == EACCES || err == EPERM)   return 403;
+		return 500;
+	}
+	struct stat st;
+	if (::fstat(fd, &st) < 0) {
+		::close(fd);
+		return 500;
+	}
+	if (!S_ISREG(st.st_mode)) {
+		::close(fd);
+		return 500;
+	}
+	if (static_cast<std::size_t>(st.st_size) > maxBytes) {
+		::close(fd);
+		return 413;
+	}
+	out.resize(static_cast<std::size_t>(st.st_size));
+	std::size_t total = 0;
+	while (total < static_cast<std::size_t>(st.st_size)) {
+		ssize_t r = ::read(fd,
+		                   const_cast<char *>(out.data()) + total,
+		                   static_cast<std::size_t>(st.st_size) - total);
+		if (r <= 0) break;
+		total += static_cast<std::size_t>(r);
+	}
+	::close(fd);
+	if (total != static_cast<std::size_t>(st.st_size)) {
+		out.resize(total);
+	}
+	return 0;
+}
+
+// If path is a directory, look for the configured index files in order.
+// Returns 0 and sets outPath to the resolved file path on success.
+// Returns a non-zero HTTP status if none match (403 when no autoindex,
+// 404 when the directory itself is missing after stat).
+int resolveIndex(const std::string              &dirPath,
+                 const std::vector<std::string> &indexes,
+                 std::string                    &outPath)
+{
+	for (std::size_t i = 0; i < indexes.size(); ++i) {
+		std::string candidate = joinPath(dirPath, indexes[i]);
+		struct stat st;
+		if (::stat(candidate.c_str(), &st) == 0 && S_ISREG(st.st_mode)) {
+			outPath = candidate;
+			return 0;
+		}
+	}
+	return 403;    // no index; autoindex handling is feat/16
+}
+
+void writeErrorBody(webserv::http::Response &r, int status)
+{
+	std::string body;
+	body += strutil::toStr(static_cast<long>(status));
+	body += " ";
+	body += webserv::http::reasonPhrase(status);
+	body += "\n";
+	r.setStatus(status);
+	r.setContentType("text/plain; charset=utf-8");
+	r.setBody(body);
+}
+
+} // anonymous
+
+void serveStatic(const webserv::http::Request &req,
+                 const webserv::RouteMatch    &match,
+                 webserv::http::Response      &response)
+{
+	response.setKeepAlive(req.keepAlive);
+
+	// Router-level failure surfaced before we get here should never
+	// invoke serveStatic; treat it as a bug and 500.
+	if (match.errorStatus != 0 || match.server == NULL) {
+		writeErrorBody(response, match.errorStatus ? match.errorStatus : 500);
+		return;
+	}
+
+	// Method policy: prefer location's list; fall back to server-wide.
+	const std::vector<std::string> *allowed = NULL;
+	if (match.location != NULL && !match.location->allowedMethods.empty()) {
+		allowed = &match.location->allowedMethods;
+	}
+	std::vector<std::string> empty;
+	if (allowed == NULL) allowed = &empty;
+	if (!methodAllowed(req.method, *allowed)) {
+		response.setHeader("Allow", allowHeaderFromMethods(*allowed));
+		writeErrorBody(response, 405);
+		return;
+	}
+
+	// Location may declare `return CODE [URL];` — honor that first.
+	if (match.location != NULL && match.location->hasReturn) {
+		int code = match.location->ret.code;
+		response.setStatus(code);
+		response.setContentType("text/plain; charset=utf-8");
+		if (!match.location->ret.url.empty()) {
+			response.setHeader("Location", match.location->ret.url);
+		}
+		std::string body;
+		body += strutil::toStr(static_cast<long>(code));
+		body += " ";
+		body += webserv::http::reasonPhrase(code);
+		body += "\n";
+		response.setBody(body);
+		return;
+	}
+
+	// Assemble filesystem path from the location's root (or the server's
+	// root if the location didn't set one).
+	std::string root = (match.location != NULL && !match.location->root.empty())
+	                 ? match.location->root
+	                 : match.server->root;
+	if (root.empty()) {
+		writeErrorBody(response, 500);
+		return;
+	}
+	std::string relPath = match.normalizedPath.empty() ? "/" : match.normalizedPath;
+	std::string fsPath  = joinPath(root, relPath);
+
+	struct stat st;
+	if (::stat(fsPath.c_str(), &st) < 0) {
+		int err = errno;
+		writeErrorBody(response,
+		               (err == ENOENT || err == ENOTDIR) ? 404 : 500);
+		return;
+	}
+
+	// Directory: try index files, then autoindex (feat/16 will fill in),
+	// then 403.
+	if (S_ISDIR(st.st_mode)) {
+		// Prefer location-level indexes if set, else server-level.
+		const std::vector<std::string> *indexes =
+			(match.location != NULL && !match.location->indexes.empty())
+			? &match.location->indexes
+			: &match.server->indexes;
+
+		std::string idxPath;
+		if (indexes->empty()) {
+			// No index configured. Autoindex arrives in feat/16.
+			bool autoindex = (match.location != NULL)
+			               ? match.location->autoindex
+			               : match.server->autoindex;
+			if (autoindex) {
+				response.setStatus(501);
+				response.setBody("autoindex not implemented yet\n");
+				return;
+			}
+			writeErrorBody(response, 403);
+			return;
+		}
+		int r = resolveIndex(fsPath, *indexes, idxPath);
+		if (r != 0) {
+			writeErrorBody(response, r);
+			return;
+		}
+		fsPath = idxPath;
+		if (::stat(fsPath.c_str(), &st) < 0) {
+			writeErrorBody(response, 404);
+			return;
+		}
+	}
+
+	if (!S_ISREG(st.st_mode)) {
+		writeErrorBody(response, 403);
+		return;
+	}
+
+	std::string body;
+	int status = readWholeFile(fsPath, kMaxStaticFile, body);
+	if (status != 0) {
+		writeErrorBody(response, status);
+		return;
+	}
+
+	response.setStatus(200);
+	response.setContentType(webserv::http::mimeForFilename(fsPath));
+	// HEAD: same headers, empty body per RFC 7231.
+	if (req.method == "HEAD") {
+		response.setHeader("Content-Length",
+		                   strutil::toStr(static_cast<long>(body.size())));
+		response.setBody(std::string());
+	} else {
+		response.setBody(body);
+	}
+
+	LOG_INFO("static: " << req.method << " " << req.path
+	         << " -> " << fsPath << " (" << body.size() << "B)");
+}
+
+} // namespace handler
+} // namespace webserv
