@@ -3,6 +3,7 @@
 #include "webserv/Log.hpp"
 #include "webserv/StringUtil.hpp"
 #include "webserv/handler/Autoindex.hpp"
+#include "webserv/handler/ErrorPage.hpp"
 #include "webserv/http/Mime.hpp"
 
 #include <cerrno>
@@ -119,16 +120,11 @@ int resolveIndex(const std::string              &dirPath,
 	return 403;    // no index; autoindex handling is feat/16
 }
 
-void writeErrorBody(webserv::http::Response &r, int status)
+void writeErrorBody(webserv::http::Response      &r,
+                    int                           status,
+                    const webserv::RouteMatch    *match)
 {
-	std::string body;
-	body += strutil::toStr(static_cast<long>(status));
-	body += " ";
-	body += webserv::http::reasonPhrase(status);
-	body += "\n";
-	r.setStatus(status);
-	r.setContentType("text/plain; charset=utf-8");
-	r.setBody(body);
+	emitError(status, match, r);
 }
 
 } // anonymous
@@ -139,10 +135,13 @@ void serveStatic(const webserv::http::Request &req,
 {
 	response.setKeepAlive(req.keepAlive);
 
-	// Router-level failure surfaced before we get here should never
-	// invoke serveStatic; treat it as a bug and 500.
+	// A router-level failure at this point still owns error_page
+	// resolution when the server itself was identified (the reordered
+	// Router::match keeps server != NULL even for path traversal 400).
 	if (match.errorStatus != 0 || match.server == NULL) {
-		writeErrorBody(response, match.errorStatus ? match.errorStatus : 500);
+		writeErrorBody(response,
+		               match.errorStatus ? match.errorStatus : 500,
+		               &match);
 		return;
 	}
 
@@ -155,7 +154,7 @@ void serveStatic(const webserv::http::Request &req,
 	if (allowed == NULL) allowed = &empty;
 	if (!methodAllowed(req.method, *allowed)) {
 		response.setHeader("Allow", allowHeaderFromMethods(*allowed));
-		writeErrorBody(response, 405);
+		writeErrorBody(response, 405, &match);
 		return;
 	}
 
@@ -182,7 +181,7 @@ void serveStatic(const webserv::http::Request &req,
 	                 ? match.location->root
 	                 : match.server->root;
 	if (root.empty()) {
-		writeErrorBody(response, 500);
+		writeErrorBody(response, 500, &match);
 		return;
 	}
 	std::string relPath = match.normalizedPath.empty() ? "/" : match.normalizedPath;
@@ -192,7 +191,8 @@ void serveStatic(const webserv::http::Request &req,
 	if (::stat(fsPath.c_str(), &st) < 0) {
 		int err = errno;
 		writeErrorBody(response,
-		               (err == ENOENT || err == ENOTDIR) ? 404 : 500);
+		               (err == ENOENT || err == ENOTDIR) ? 404 : 500,
+		               &match);
 		return;
 	}
 
@@ -227,13 +227,13 @@ void serveStatic(const webserv::http::Request &req,
 
 		if (!resolvedIndex) {
 			if (!autoindex) {
-				writeErrorBody(response, 403);
+				writeErrorBody(response, 403, &match);
 				return;
 			}
 			std::string html;
 			int st_ai = renderAutoindex(fsPath, relPath, html);
 			if (st_ai != 0) {
-				writeErrorBody(response, st_ai);
+				writeErrorBody(response, st_ai, &match);
 				return;
 			}
 			response.setStatus(200);
@@ -253,20 +253,20 @@ void serveStatic(const webserv::http::Request &req,
 
 		fsPath = idxPath;
 		if (::stat(fsPath.c_str(), &st) < 0) {
-			writeErrorBody(response, 404);
+			writeErrorBody(response, 404, &match);
 			return;
 		}
 	}
 
 	if (!S_ISREG(st.st_mode)) {
-		writeErrorBody(response, 403);
+		writeErrorBody(response, 403, &match);
 		return;
 	}
 
 	std::string body;
 	int status = readWholeFile(fsPath, kMaxStaticFile, body);
 	if (status != 0) {
-		writeErrorBody(response, status);
+		writeErrorBody(response, status, &match);
 		return;
 	}
 
