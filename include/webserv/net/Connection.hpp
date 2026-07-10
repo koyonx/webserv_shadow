@@ -12,6 +12,7 @@
 namespace webserv {
 
 class Connection;
+class Router;
 
 // Owner-side callback: called by the Connection when it is finished
 // with its life cycle (response fully written, EOF, or timeout). The
@@ -41,7 +42,8 @@ public:
 	Connection(int                            cfd,
 	           const webserv::config::Listen &origin,
 	           IConnectionOwner              &owner,
-	           long                           idleTimeoutMs);
+	           long                           idleTimeoutMs,
+	           const Router                  *router);
 	virtual ~Connection();
 
 	// IHandler
@@ -66,6 +68,7 @@ private:
 	webserv::config::Listen        m_origin;
 	IConnectionOwner              &m_owner;
 	long                           m_idleMs;
+	const Router                  *m_router;
 	State                          m_state;
 	std::string                    m_readBuf;
 	std::string                    m_writeBuf;

@@ -9,6 +9,7 @@
 #include "webserv/net/Connection.hpp"
 #include "webserv/net/ConnectionSpawner.hpp"
 #include "webserv/net/Listener.hpp"
+#include "webserv/net/Router.hpp"
 
 #include <cstdlib>
 #include <cstring>
@@ -96,12 +97,12 @@ int runTestListener(int port, long runMs)
 
 int runTestConnection(int port, long runMs)
 {
-	webserv::PollLoop         loop;
+	webserv::PollLoop          loop;
 	webserv::ConnectionSpawner spawner(5000, 100);
 	spawner.arm(loop);
 
-	webserv::config::Listen   cfg("127.0.0.1", port);
-	webserv::Listener         listener(cfg, spawner);
+	webserv::config::Listen    cfg("127.0.0.1", port);
+	webserv::Listener          listener(cfg, spawner);
 	listener.bindAndListen();
 	loop.add(&listener);
 
@@ -111,6 +112,104 @@ int runTestConnection(int port, long runMs)
 	LOG_INFO("--test-connection exit; live=" << spawner.liveCount()
 	         << " pending_dead=" << spawner.deadPendingCount());
 	return 0;
+}
+
+// --------------------- --test-router ---------------------
+
+// Runs a small suite against the Router. No sockets: purely exercises
+// path normalization, server_name matching, and location prefix logic.
+
+static const char *kRouterSample =
+	"http {\n"
+	"    server {\n"
+	"        listen 0.0.0.0:8080;\n"
+	"        server_name a.example.com;\n"
+	"        location / { allowed_methods GET; }\n"
+	"        location /api { allowed_methods GET POST; }\n"
+	"        location /api/v1 { allowed_methods GET; }\n"
+	"    }\n"
+	"    server {\n"
+	"        listen 0.0.0.0:8080;\n"
+	"        server_name b.example.com;\n"
+	"        location / { allowed_methods GET; }\n"
+	"    }\n"
+	"    server {\n"
+	"        listen 0.0.0.0:8080;\n"
+	"        server_name *.wildcard.com;\n"
+	"        location / { allowed_methods GET; }\n"
+	"    }\n"
+	"}\n";
+
+struct RouterCase {
+	const char *host;
+	const char *path;
+	const char *expectServer;
+	const char *expectLocation;
+	const char *expectNormalized;
+	int         expectStatus;
+};
+
+static int runTestRouter()
+{
+	webserv::config::ConfigAst ast =
+		webserv::config::parseString(kRouterSample, "<router-embed>");
+	webserv::config::Config    cfg = webserv::config::validate(ast);
+	webserv::Router            router(cfg);
+	webserv::config::Listen    origin("0.0.0.0", 8080);
+
+	RouterCase cases[] = {
+		{ "a.example.com", "/",             "a.example.com",       "/",       "/",       0 },
+		{ "a.example.com", "/api/foo",      "a.example.com",       "/api",    "/api/foo",0 },
+		{ "a.example.com", "/api/v1/x",     "a.example.com",       "/api/v1", "/api/v1/x",0 },
+		{ "b.example.com", "/",             "b.example.com",       "/",       "/",       0 },
+		{ "sub.wildcard.com", "/hello",     "*.wildcard.com",      "/",       "/hello",  0 },
+		{ "unknown.host",   "/",            "a.example.com",       "/",       "/",       0 },  // default = first server
+		{ "a.example.com", "/../etc/passwd","",                    "",        "",        400 },
+		{ "a.example.com", "/a/../b/",      "a.example.com",       "/",       "/b/",     0 },
+		{ "a.example.com", "/./././x",      "a.example.com",       "/",       "/x",      0 },
+		{ "a.example.com", "/api/./v1/../v1/y", "a.example.com",   "/api/v1", "/api/v1/y",0 }
+	};
+	const std::size_t n = sizeof(cases) / sizeof(cases[0]);
+	int failures = 0;
+
+	for (std::size_t i = 0; i < n; ++i) {
+		const RouterCase &c = cases[i];
+		webserv::http::Request req;
+		req.method   = "GET";
+		req.path     = c.path;
+		req.authority = c.host;
+		req.version  = webserv::http::Version(1, 1);
+
+		webserv::RouteMatch m = router.match(origin, req);
+
+		std::string actualServer = "(none)";
+		if (m.server != NULL && !m.server->serverNames.empty()) {
+			actualServer = m.server->serverNames.front();
+		}
+		std::string actualLoc = (m.location != NULL) ? m.location->path
+		                                             : std::string("(none)");
+		std::string actualNorm = m.normalizedPath;
+		int         actualStat = m.errorStatus;
+
+		bool ok = true;
+		if (c.expectStatus != 0) {
+			ok = (actualStat == c.expectStatus);
+		} else {
+			if (actualStat != 0)                                 ok = false;
+			if (std::string(c.expectServer) != actualServer)     ok = false;
+			if (std::string(c.expectLocation) != actualLoc)      ok = false;
+			if (std::string(c.expectNormalized) != actualNorm)   ok = false;
+		}
+		LOG_INFO((ok ? "PASS " : "FAIL ") << "[" << i << "] "
+		         << c.host << c.path
+		         << " -> server=" << actualServer
+		         << " loc=" << actualLoc
+		         << " norm=" << actualNorm
+		         << " status=" << actualStat);
+		if (!ok) ++failures;
+	}
+	LOG_INFO("--test-router: " << (n - failures) << "/" << n << " passed");
+	return failures == 0 ? 0 : 1;
 }
 
 } // namespace
@@ -132,6 +231,10 @@ int main(int argc, char **argv)
 		int  port  = (argc >= 3) ? std::atoi(argv[2]) : 18080;
 		long runMs = (argc >= 4) ? std::atol(argv[3]) : 2000;
 		try { return runTestConnection(port, runMs); }
+		catch (const webserv::Exception &e) { LOG_ERROR(e.what()); return 1; }
+	}
+	if (argc >= 2 && std::strcmp(argv[1], "--test-router") == 0) {
+		try { return runTestRouter(); }
 		catch (const webserv::Exception &e) { LOG_ERROR(e.what()); return 1; }
 	}
 

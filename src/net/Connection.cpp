@@ -3,6 +3,7 @@
 #include "webserv/Log.hpp"
 #include "webserv/core/PollLoop.hpp"
 #include "webserv/http/Response.hpp"
+#include "webserv/net/Router.hpp"
 
 #include <poll.h>
 #include <unistd.h>
@@ -12,11 +13,13 @@ namespace webserv {
 Connection::Connection(int                            cfd,
                        const webserv::config::Listen &origin,
                        IConnectionOwner              &owner,
-                       long                           idleTimeoutMs)
+                       long                           idleTimeoutMs,
+                       const Router                  *router)
 	: m_fd(cfd),
 	  m_origin(origin),
 	  m_owner(owner),
 	  m_idleMs(idleTimeoutMs),
+	  m_router(router),
 	  m_state(kReadingRequest),
 	  m_readBuf(),
 	  m_writeBuf(),
@@ -44,11 +47,40 @@ Connection::State    Connection::state()  const { return m_state; }
 
 void Connection::generateStubResponse()
 {
-	// Skeleton response. Real handlers arrive in Phase 4.
-	const std::string body = "webserv connection FSM skeleton\n";
+	const webserv::http::Request &req = m_parser.request();
+
+	// Route the request if we have a Router configured. Feat/15 will
+	// turn a successful match into a real static-file response; here we
+	// only prove the routing chain.
+	std::string body = "webserv connection FSM skeleton\n";
+	int         status = 200;
+	if (m_router != NULL) {
+		RouteMatch m = m_router->match(m_origin, req);
+		if (m.errorStatus != 0) {
+			generateErrorResponse(m.errorStatus);
+			return;
+		}
+		std::string srvName = "(default)";
+		if (m.server != NULL && !m.server->serverNames.empty()) {
+			srvName = m.server->serverNames.front();
+		}
+		std::string locPath = (m.location != NULL) ? m.location->path
+		                                           : std::string("(server root)");
+		LOG_INFO("Connection fd=" << m_fd.get()
+		         << " routed: server=" << srvName
+		         << " location=" << locPath
+		         << " normPath=" << m.normalizedPath);
+		body  = "matched server_name=";
+		body += srvName;
+		body += " location=";
+		body += locPath;
+		body += " normalized=";
+		body += m.normalizedPath;
+		body += "\n";
+	}
 	webserv::http::Response r;
-	r.setStatus(200);
-	r.setKeepAlive(m_parser.request().keepAlive);
+	r.setStatus(status);
+	r.setKeepAlive(req.keepAlive);
 	r.setBody(body);
 	m_writeBuf = r.serialize();
 	m_writePos = 0;

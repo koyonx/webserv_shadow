@@ -7,10 +7,12 @@
 
 namespace webserv {
 
-ConnectionSpawner::ConnectionSpawner(long idleTimeoutMs,
-                                     long sweepIntervalMs)
+ConnectionSpawner::ConnectionSpawner(long          idleTimeoutMs,
+                                     long          sweepIntervalMs,
+                                     const Router *router)
 	: m_idleMs(idleTimeoutMs),
 	  m_sweepMs(sweepIntervalMs),
+	  m_router(router),
 	  m_armed(false),
 	  m_live(),
 	  m_dead()
@@ -43,7 +45,7 @@ void ConnectionSpawner::onAccept(int                            cfd,
                                  const webserv::config::Listen &origin,
                                  PollLoop                      &loop)
 {
-	Connection *c = new Connection(cfd, origin, *this, m_idleMs);
+	Connection *c = new Connection(cfd, origin, *this, m_idleMs, m_router);
 	loop.add(c);
 	loop.setDeadline(c, m_idleMs);
 	m_live.insert(c);
