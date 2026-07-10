@@ -1,6 +1,7 @@
 #include "webserv/Error.hpp"
 #include "webserv/Fd.hpp"
 #include "webserv/Log.hpp"
+#include "webserv/StringUtil.hpp"
 #include "webserv/config/Ast.hpp"
 #include "webserv/config/Config.hpp"
 #include "webserv/config/Parser.hpp"
@@ -14,6 +15,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
+#include <set>
 #include <unistd.h>
 
 static const char *kEmbeddedSample =
@@ -212,6 +214,55 @@ static int runTestRouter()
 	return failures == 0 ? 0 : 1;
 }
 
+// --------------------- --serve ---------------------
+
+int runServe(const std::string &confPath, long runMs)
+{
+	webserv::config::ConfigAst ast = webserv::config::parseFile(confPath);
+	webserv::config::Config    cfg = webserv::config::validate(ast);
+	webserv::Router            router(cfg);
+
+	webserv::PollLoop          loop;
+	webserv::ConnectionSpawner spawner(30000, 100, &router);
+	spawner.arm(loop);
+
+	// One Listener per unique (host, port) across all servers.
+	std::set<webserv::config::Listen>       listens;
+	std::vector<webserv::Listener *>        listeners;
+	for (std::size_t i = 0; i < cfg.servers.size(); ++i) {
+		const webserv::config::ServerConfig &s = cfg.servers[i];
+		for (std::size_t j = 0; j < s.listens.size(); ++j) {
+			listens.insert(s.listens[j]);
+		}
+	}
+	try {
+		for (std::set<webserv::config::Listen>::iterator it = listens.begin();
+		     it != listens.end(); ++it) {
+			webserv::Listener *lst = new webserv::Listener(*it, spawner);
+			try {
+				lst->bindAndListen();
+			} catch (...) {
+				delete lst;
+				throw;
+			}
+			loop.add(lst);
+			listeners.push_back(lst);
+		}
+	} catch (...) {
+		for (std::size_t i = 0; i < listeners.size(); ++i) delete listeners[i];
+		throw;
+	}
+
+	LOG_INFO("--serve: " << listeners.size() << " listener(s) up; "
+	         "SIGINT to stop"
+	         << (runMs > 0 ? (std::string(" or ") + webserv::strutil::toStr(runMs) + "ms cap") : ""));
+	loop.run(runMs > 0 ? runMs : -1);
+	LOG_INFO("--serve: loop exited; cleaning up");
+
+	for (std::size_t i = 0; i < listeners.size(); ++i) delete listeners[i];
+	return 0;
+}
+
 } // namespace
 
 int main(int argc, char **argv)
@@ -235,6 +286,12 @@ int main(int argc, char **argv)
 	}
 	if (argc >= 2 && std::strcmp(argv[1], "--test-router") == 0) {
 		try { return runTestRouter(); }
+		catch (const webserv::Exception &e) { LOG_ERROR(e.what()); return 1; }
+	}
+	if (argc >= 2 && std::strcmp(argv[1], "--serve") == 0) {
+		if (argc < 3) { LOG_ERROR("--serve requires a config file path"); return 1; }
+		long runMs = (argc >= 4) ? std::atol(argv[3]) : 0;
+		try { return runServe(argv[2], runMs); }
 		catch (const webserv::Exception &e) { LOG_ERROR(e.what()); return 1; }
 	}
 
