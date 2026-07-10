@@ -71,8 +71,11 @@ bool Connection::tryStartCgi(PollLoop &loop)
 		req, m_origin, *m.server, script, scriptUri, pathInfo);
 
 	try {
+		// 5s runtime cap for now; feat/28 wires this to a config knob.
 		m_cgi = new webserv::cgi::CgiProcess(
-			interp, script, workDir, env, req.body, *this);
+			interp, script, workDir, env, req.body, *this,
+			/*totalTimeoutMs*/  5000,
+			/*killEscalationMs*/ 200);
 		m_cgi->spawn(loop);
 	} catch (const webserv::Exception &e) {
 		LOG_WARN("cgi: spawn failed: " << e.what());
