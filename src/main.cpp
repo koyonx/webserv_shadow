@@ -7,6 +7,7 @@
 #include "webserv/config/Parser.hpp"
 #include "webserv/config/Validator.hpp"
 #include "webserv/core/PollLoop.hpp"
+#include "webserv/cgi/CgiEnv.hpp"
 #include "webserv/net/Connection.hpp"
 #include "webserv/net/ConnectionSpawner.hpp"
 #include "webserv/net/Listener.hpp"
@@ -214,6 +215,43 @@ static int runTestRouter()
 	return failures == 0 ? 0 : 1;
 }
 
+// --------------------- --test-cgi-env ---------------------
+
+static int runTestCgiEnv()
+{
+	webserv::config::ServerConfig srv;
+	srv.serverNames.push_back("example.com");
+	srv.root = "/var/www";
+
+	webserv::config::Listen origin("0.0.0.0", 8080);
+
+	webserv::http::Request req;
+	req.method   = "POST";
+	req.target   = "/cgi/foo.php?a=1&b=2";
+	req.path     = "/cgi/foo.php";
+	req.query    = "a=1&b=2";
+	req.authority = "example.com";
+	req.version   = webserv::http::Version(1, 1);
+	req.headers.insert(std::make_pair("Host", "example.com"));
+	req.headers.insert(std::make_pair("Content-Type",
+	                                  "application/x-www-form-urlencoded"));
+	req.headers.insert(std::make_pair("Content-Length", "9"));
+	req.headers.insert(std::make_pair("User-Agent", "smoke/1"));
+	req.headers.insert(std::make_pair("X-Custom-Flag", "yes"));
+	req.body = "a=1&b=42";
+	req.contentLength = 8;
+
+	std::vector<std::string> env = webserv::cgi::buildEnv(
+		req, origin, srv,
+		"/var/www/cgi/foo.php", "/cgi/foo.php", "");
+
+	LOG_INFO("--test-cgi-env: " << env.size() << " variables");
+	for (std::size_t i = 0; i < env.size(); ++i) {
+		std::cout << env[i] << "\n";
+	}
+	return 0;
+}
+
 // --------------------- --serve ---------------------
 
 int runServe(const std::string &confPath, long runMs)
@@ -286,6 +324,10 @@ int main(int argc, char **argv)
 	}
 	if (argc >= 2 && std::strcmp(argv[1], "--test-router") == 0) {
 		try { return runTestRouter(); }
+		catch (const webserv::Exception &e) { LOG_ERROR(e.what()); return 1; }
+	}
+	if (argc >= 2 && std::strcmp(argv[1], "--test-cgi-env") == 0) {
+		try { return runTestCgiEnv(); }
 		catch (const webserv::Exception &e) { LOG_ERROR(e.what()); return 1; }
 	}
 	if (argc >= 2 && std::strcmp(argv[1], "--serve") == 0) {
