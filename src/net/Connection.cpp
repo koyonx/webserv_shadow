@@ -143,15 +143,18 @@ void Connection::onReadable(PollLoop &loop)
 		if (res == webserv::http::kParseNeedMore) {
 			break;
 		}
-		// kParseComplete: request-line + stub-headers consumed.
+		// kParseComplete: full request (line + headers + body) consumed.
 		const webserv::http::Request &req = m_parser.request();
 		LOG_INFO("Connection fd=" << m_fd.get() << " request: "
 		         << req.method << " "
 		         << (req.path.empty() ? req.target : req.path)
 		         << (req.query.empty() ? "" : ("?" + req.query))
 		         << " HTTP/" << req.version.major << "." << req.version.minor
+		         << " body=" << req.body.size() << "B"
+		         << (req.chunked ? " chunked" : "")
+		         << (req.keepAlive ? " keep-alive" : " close")
 		         << (req.authority.empty() ? std::string() :
-		             (" (authority=" + req.authority + ")")));
+		             (" host=" + req.authority)));
 		generateStubResponse();
 		m_state = kWritingResponse;
 		break;

@@ -39,6 +39,7 @@ public:
 	void setMaxRequestLine(std::size_t bytes);
 	void setMaxHeaderBytes(std::size_t bytes);
 	void setMaxHeaderCount(std::size_t n);
+	void setMaxBodySize(std::size_t bytes);
 
 private:
 	RequestParser(const RequestParser &);
@@ -47,6 +48,11 @@ private:
 	enum Phase {
 		kPhaseRequestLine,
 		kPhaseHeaders,
+		kPhaseBodyCL,          // reading exactly Content-Length bytes
+		kPhaseBodyChunkSize,   // reading "hex-size [ext] CRLF"
+		kPhaseBodyChunkData,   // reading chunk data
+		kPhaseBodyChunkCRLF,   // reading CRLF after chunk data
+		kPhaseBodyTrailer,     // reading trailer field-lines (discarded)
 		kPhaseDone,
 		kPhaseError
 	};
@@ -57,6 +63,9 @@ private:
 	ParseResult feedHeaders(const char *data,
 	                        std::size_t len,
 	                        std::size_t &consumed);
+	ParseResult feedBody(const char *data,
+	                     std::size_t len,
+	                     std::size_t &consumed);
 
 	bool  parseAccumulatedRequestLine();
 	bool  parseRequestTarget();
@@ -65,20 +74,24 @@ private:
 	bool  parseHeaderLine(const std::string &line);
 	bool  finalizeHeaders();
 
+	bool  parseChunkSizeLine();
+
 	void  setError(int status, const char *msg);
 
 	Phase       m_phase;
 	Request     m_req;
 
-	std::string m_line;         // accumulator for request-line and header lines
-	bool        m_lineLast;     // set once we've seen a header line so the
-	                            // next empty line means "headers done"
+	std::string m_line;   // accumulator for request-line, headers, chunk lines
 
 	std::size_t m_maxLine;
 	std::size_t m_maxHeaderBytes;
 	std::size_t m_maxHeaderCount;
+	std::size_t m_maxBody;
 	std::size_t m_headerBytesSoFar;
 	std::size_t m_headerCountSoFar;
+
+	std::size_t m_bodyBytesRead;
+	std::size_t m_chunkRemaining;
 
 	bool        m_seenHost;
 	bool        m_seenContentLength;
