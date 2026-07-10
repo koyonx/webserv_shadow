@@ -3,6 +3,7 @@
 #include "webserv/StringUtil.hpp"
 #include "webserv/handler/DeleteHandler.hpp"
 #include "webserv/handler/ErrorPage.hpp"
+#include "webserv/handler/PostHandler.hpp"
 #include "webserv/handler/StaticHandler.hpp"
 
 namespace webserv {
@@ -94,8 +95,7 @@ void dispatch(const webserv::http::Request &req,
 		return;
 	}
 	if (req.method == "POST") {
-		// feat/19 lands the real POST handler; until then, 501.
-		emitError(501, &match, response);
+		servePost(req, match, response);
 		return;
 	}
 	emitError(501, &match, response);
