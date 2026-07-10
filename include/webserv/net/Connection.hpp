@@ -4,6 +4,7 @@
 #include "webserv/Fd.hpp"
 #include "webserv/config/Config.hpp"
 #include "webserv/core/IHandler.hpp"
+#include "webserv/http/RequestParser.hpp"
 
 #include <cstddef>
 #include <string>
@@ -58,17 +59,20 @@ private:
 	Connection &operator=(const Connection &);
 
 	void generateStubResponse();
+	void generateErrorResponse(int status);
 	void finish(PollLoop &loop);
 
-	Fd                       m_fd;
-	webserv::config::Listen  m_origin;
-	IConnectionOwner        &m_owner;
-	long                     m_idleMs;
-	State                    m_state;
-	std::string              m_readBuf;
-	std::string              m_writeBuf;
-	std::size_t              m_writePos;
-	bool                     m_done;
+	Fd                             m_fd;
+	webserv::config::Listen        m_origin;
+	IConnectionOwner              &m_owner;
+	long                           m_idleMs;
+	State                          m_state;
+	std::string                    m_readBuf;
+	std::string                    m_writeBuf;
+	std::size_t                    m_writePos;
+	bool                           m_done;
+
+	webserv::http::RequestParser   m_parser;
 };
 
 } // namespace webserv
