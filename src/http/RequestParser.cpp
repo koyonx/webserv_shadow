@@ -531,6 +531,27 @@ bool RequestParser::finalizeHeaders()
 		}
 	}
 
+	// Cookie header (RFC 6265 §5.4). Names are case-sensitive.
+	HeaderMap::const_iterator ckIt = m_req.headers.find("Cookie");
+	if (ckIt != m_req.headers.end()) {
+		std::vector<std::string> pairs = strutil::split(ckIt->second, ';');
+		for (std::size_t i = 0; i < pairs.size(); ++i) {
+			std::string p = strutil::trim(pairs[i]);
+			if (p.empty()) continue;
+			std::string::size_type eq = p.find('=');
+			if (eq == std::string::npos) continue;
+			std::string name  = strutil::trim(p.substr(0, eq));
+			std::string value = strutil::trim(p.substr(eq + 1));
+			// Strip surrounding quotes on the value.
+			if (value.size() >= 2 && value[0] == '"'
+			 && value[value.size() - 1] == '"') {
+				value = value.substr(1, value.size() - 2);
+			}
+			if (name.empty()) continue;
+			m_req.cookies[name] = value;
+		}
+	}
+
 	// Decide the next phase: body (CL or chunked) or done.
 	m_line.clear();
 	if (m_req.chunked) {
