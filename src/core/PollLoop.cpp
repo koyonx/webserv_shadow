@@ -404,7 +404,13 @@ void PollLoop::run(long stopAfterMs)
 		}
 
 		m_dispatching = true;
-		for (std::size_t i = 0; i < m_handlers.size(); ++i) {
+		// Cache the number of handler slots at dispatch entry: a
+		// callback may call add() (e.g. Listener accepting a new
+		// Connection) which grows m_handlers past m_pfds. Newly-added
+		// handlers get their first dispatch on the next tick after
+		// rebuildPfds().
+		std::size_t nInit = m_pfds.empty() ? 0 : m_pfds.size() - 1;
+		for (std::size_t i = 0; i < nInit; ++i) {
 			IHandler *h = m_handlers[i];
 			if (m_pendingRemove.count(h) > 0) {
 				continue;

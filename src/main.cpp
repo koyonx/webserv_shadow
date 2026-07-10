@@ -6,6 +6,8 @@
 #include "webserv/config/Parser.hpp"
 #include "webserv/config/Validator.hpp"
 #include "webserv/core/PollLoop.hpp"
+#include "webserv/net/Connection.hpp"
+#include "webserv/net/ConnectionSpawner.hpp"
 #include "webserv/net/Listener.hpp"
 
 #include <cstdlib>
@@ -26,7 +28,7 @@ static const char *kEmbeddedSample =
 
 namespace {
 
-// --------------------- --test-loop shell ---------------------
+// --------------------- --test-loop ---------------------
 
 class ShutdownAfterHandler : public webserv::IHandler {
 public:
@@ -48,28 +50,23 @@ private:
 
 int runTestLoop()
 {
-	LOG_INFO("PollLoop --test-loop: constructing loop");
-	webserv::PollLoop loop;
-	ShutdownAfterHandler h;
+	webserv::PollLoop     loop;
+	ShutdownAfterHandler  h;
 	loop.add(&h);
 	loop.setDeadline(&h, 300);
-	LOG_INFO("running loop with 2s cap; expect timer at 300ms");
 	loop.run(2000);
-	LOG_INFO("loop exited; timer_fired=" << (h.fired() ? "yes" : "no"));
+	LOG_INFO("--test-loop exit; timer_fired=" << (h.fired() ? "yes" : "no"));
 	return h.fired() ? 0 : 1;
 }
 
-// --------------------- --test-listener shell ---------------------
+// --------------------- --test-listener ---------------------
 
 class LogAcceptSink : public webserv::IAcceptSink {
 public:
 	LogAcceptSink() : m_count(0) {}
 	int count() const { return m_count; }
-
-	void onAccept(int                                    cfd,
-	              const webserv::config::Listen         &origin,
-	              webserv::PollLoop                     & /*loop*/)
-	{
+	void onAccept(int cfd, const webserv::config::Listen &origin,
+	              webserv::PollLoop &) {
 		++m_count;
 		LOG_INFO("accepted client fd=" << cfd
 		         << " on " << origin.host << ":" << origin.port
@@ -82,16 +79,37 @@ private:
 
 int runTestListener(int port, long runMs)
 {
-	webserv::PollLoop      loop;
+	webserv::PollLoop       loop;
 	webserv::config::Listen cfg("127.0.0.1", port);
-	LogAcceptSink          sink;
-	webserv::Listener      listener(cfg, sink);
+	LogAcceptSink           sink;
+	webserv::Listener       listener(cfg, sink);
 	listener.bindAndListen();
 	loop.add(&listener);
-	LOG_INFO("listening on 127.0.0.1:" << port << " for " << runMs << "ms; "
-	         << "SIGINT or timeout stops the loop");
+	LOG_INFO("--test-listener on 127.0.0.1:" << port
+	         << " for " << runMs << "ms");
 	loop.run(runMs);
 	LOG_INFO("--test-listener exit; accepted=" << sink.count());
+	return 0;
+}
+
+// --------------------- --test-connection ---------------------
+
+int runTestConnection(int port, long runMs)
+{
+	webserv::PollLoop         loop;
+	webserv::ConnectionSpawner spawner(5000, 100);
+	spawner.arm(loop);
+
+	webserv::config::Listen   cfg("127.0.0.1", port);
+	webserv::Listener         listener(cfg, spawner);
+	listener.bindAndListen();
+	loop.add(&listener);
+
+	LOG_INFO("--test-connection on 127.0.0.1:" << port
+	         << " for " << runMs << "ms (skeleton HTTP response)");
+	loop.run(runMs);
+	LOG_INFO("--test-connection exit; live=" << spawner.liveCount()
+	         << " pending_dead=" << spawner.deadPendingCount());
 	return 0;
 }
 
@@ -107,12 +125,14 @@ int main(int argc, char **argv)
 	if (argc >= 2 && std::strcmp(argv[1], "--test-listener") == 0) {
 		int  port  = (argc >= 3) ? std::atoi(argv[2]) : 18080;
 		long runMs = (argc >= 4) ? std::atol(argv[3]) : 2000;
-		try {
-			return runTestListener(port, runMs);
-		} catch (const webserv::Exception &e) {
-			LOG_ERROR("listener: " << e.what());
-			return 1;
-		}
+		try { return runTestListener(port, runMs); }
+		catch (const webserv::Exception &e) { LOG_ERROR(e.what()); return 1; }
+	}
+	if (argc >= 2 && std::strcmp(argv[1], "--test-connection") == 0) {
+		int  port  = (argc >= 3) ? std::atoi(argv[2]) : 18080;
+		long runMs = (argc >= 4) ? std::atol(argv[3]) : 2000;
+		try { return runTestConnection(port, runMs); }
+		catch (const webserv::Exception &e) { LOG_ERROR(e.what()); return 1; }
 	}
 
 	LOG_INFO("webserv: config validator smoke test");
@@ -123,8 +143,8 @@ int main(int argc, char **argv)
 			ast = webserv::config::parseFile(argv[1]);
 		} else {
 			LOG_INFO("parsing embedded sample "
-			         "(pass a .conf path as argv[1], "
-			         "or --test-loop / --test-listener)");
+			         "(pass a .conf path as argv[1], or one of "
+			         "--test-loop / --test-listener / --test-connection)");
 			ast = webserv::config::parseString(kEmbeddedSample, "<embedded>");
 		}
 		webserv::config::Config cfg = webserv::config::validate(ast);
