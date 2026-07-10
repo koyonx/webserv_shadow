@@ -126,12 +126,14 @@ RequestParser::RequestParser()
 	: m_phase(kPhaseRequestLine),
 	  m_req(),
 	  m_line(),
-	  m_lineLast(false),
 	  m_maxLine(8192),
 	  m_maxHeaderBytes(32 * 1024),
 	  m_maxHeaderCount(100),
+	  m_maxBody(1024UL * 1024UL),
 	  m_headerBytesSoFar(0),
 	  m_headerCountSoFar(0),
+	  m_bodyBytesRead(0),
+	  m_chunkRemaining(0),
 	  m_seenHost(false),
 	  m_seenContentLength(false),
 	  m_seenTransferEncoding(false),
@@ -144,9 +146,10 @@ void RequestParser::reset()
 	m_phase = kPhaseRequestLine;
 	m_req.clear();
 	m_line.clear();
-	m_lineLast              = false;
 	m_headerBytesSoFar      = 0;
 	m_headerCountSoFar      = 0;
+	m_bodyBytesRead         = 0;
+	m_chunkRemaining        = 0;
 	m_seenHost              = false;
 	m_seenContentLength     = false;
 	m_seenTransferEncoding  = false;
@@ -160,6 +163,7 @@ const char    *RequestParser::errorMessage() const { return m_errmsg; }
 void           RequestParser::setMaxRequestLine(std::size_t b) { m_maxLine = b; }
 void           RequestParser::setMaxHeaderBytes(std::size_t b) { m_maxHeaderBytes = b; }
 void           RequestParser::setMaxHeaderCount(std::size_t n) { m_maxHeaderCount = n; }
+void           RequestParser::setMaxBodySize(std::size_t b)    { m_maxBody = b; }
 
 void RequestParser::setError(int status, const char *msg)
 {
@@ -188,6 +192,14 @@ ParseResult RequestParser::feed(const char *data,
 		if (m_phase == kPhaseHeaders) {
 			std::size_t c = 0;
 			ParseResult r = feedHeaders(data + consumed, len - consumed, c);
+			consumed += c;
+			if (r != kParseNeedMore) return r;
+			if (m_phase < kPhaseBodyCL) return kParseNeedMore;
+			// fall through into body phase in same feed()
+		}
+		if (m_phase >= kPhaseBodyCL && m_phase <= kPhaseBodyTrailer) {
+			std::size_t c = 0;
+			ParseResult r = feedBody(data + consumed, len - consumed, c);
 			consumed += c;
 			if (r != kParseNeedMore) return r;
 			return kParseNeedMore;
@@ -350,10 +362,11 @@ ParseResult RequestParser::feedHeaders(const char *data,
 				m_line.erase(m_line.size() - 1);
 			}
 			if (m_line.empty()) {
-				// End of headers.
+				// End of headers. finalizeHeaders() decides whether
+				// we still need to read a body.
 				if (!finalizeHeaders()) return kParseError;
-				m_phase = kPhaseDone;
-				return kParseComplete;
+				if (m_phase == kPhaseDone) return kParseComplete;
+				return kParseNeedMore;
 			}
 			// Reject obs-fold: line starting with SP/HTAB continues
 			// the previous field. RFC 7230 §3.2.4 says a server MUST
@@ -518,7 +531,154 @@ bool RequestParser::finalizeHeaders()
 		}
 	}
 
+	// Decide the next phase: body (CL or chunked) or done.
+	m_line.clear();
+	if (m_req.chunked) {
+		m_phase = kPhaseBodyChunkSize;
+	} else if (m_req.contentLength > 0) {
+		if (m_req.contentLength > m_maxBody) {
+			setError(413, "declared Content-Length exceeds max body size");
+			return false;
+		}
+		m_req.body.reserve(m_req.contentLength);
+		m_phase = kPhaseBodyCL;
+	} else {
+		m_phase = kPhaseDone;
+	}
 	return true;
+}
+
+// -------- body --------
+
+bool RequestParser::parseChunkSizeLine()
+{
+	std::string s = m_line;
+	std::string::size_type semi = s.find(';');
+	if (semi != std::string::npos) {
+		s = s.substr(0, semi);
+	}
+	while (!s.empty() && (s[s.size() - 1] == ' ' || s[s.size() - 1] == '\t')) {
+		s.erase(s.size() - 1);
+	}
+	if (s.empty()) {
+		setError(400, "empty chunk size"); return false;
+	}
+	std::size_t sz = 0;
+	for (std::size_t i = 0; i < s.size(); ++i) {
+		int h = 0;
+		if (!hexDigit(s[i], h)) {
+			setError(400, "invalid chunk size digit"); return false;
+		}
+		if (sz > (static_cast<std::size_t>(-1) - static_cast<std::size_t>(h)) / 16) {
+			setError(413, "chunk size overflow"); return false;
+		}
+		sz = sz * 16 + static_cast<std::size_t>(h);
+	}
+	if (m_bodyBytesRead + sz > m_maxBody) {
+		setError(413, "body exceeds max size"); return false;
+	}
+	m_chunkRemaining = sz;
+	return true;
+}
+
+ParseResult RequestParser::feedBody(const char *data,
+                                    std::size_t len,
+                                    std::size_t &consumed)
+{
+	consumed = 0;
+	while (consumed < len) {
+		if (m_phase == kPhaseBodyCL) {
+			std::size_t need  = m_req.contentLength - m_bodyBytesRead;
+			std::size_t avail = len - consumed;
+			std::size_t take  = (need < avail) ? need : avail;
+			m_req.body.append(data + consumed, take);
+			m_bodyBytesRead += take;
+			consumed        += take;
+			if (m_bodyBytesRead == m_req.contentLength) {
+				m_phase = kPhaseDone;
+				return kParseComplete;
+			}
+			return kParseNeedMore;
+		}
+
+		if (m_phase == kPhaseBodyChunkSize) {
+			char c = data[consumed++];
+			if (c == '\n') {
+				if (!m_line.empty() && m_line[m_line.size() - 1] == '\r') {
+					m_line.erase(m_line.size() - 1);
+				}
+				if (!parseChunkSizeLine()) return kParseError;
+				m_line.clear();
+				m_phase = (m_chunkRemaining == 0)
+				        ? kPhaseBodyTrailer
+				        : kPhaseBodyChunkData;
+				continue;
+			}
+			m_line += c;
+			if (m_line.size() > 1024) {
+				setError(400, "chunk size line too long");
+				return kParseError;
+			}
+			continue;
+		}
+
+		if (m_phase == kPhaseBodyChunkData) {
+			std::size_t avail = len - consumed;
+			std::size_t take  = (m_chunkRemaining < avail) ? m_chunkRemaining : avail;
+			m_req.body.append(data + consumed, take);
+			m_bodyBytesRead  += take;
+			m_chunkRemaining -= take;
+			consumed         += take;
+			if (m_bodyBytesRead > m_maxBody) {
+				setError(413, "body exceeds max size");
+				return kParseError;
+			}
+			if (m_chunkRemaining == 0) {
+				m_line.clear();
+				m_phase = kPhaseBodyChunkCRLF;
+			}
+			continue;
+		}
+
+		if (m_phase == kPhaseBodyChunkCRLF) {
+			char c = data[consumed++];
+			m_line += c;
+			if (m_line == "\r\n" || m_line == "\n") {
+				m_line.clear();
+				m_phase = kPhaseBodyChunkSize;
+				continue;
+			}
+			if (m_line.size() >= 2) {
+				setError(400, "expected CRLF after chunk data");
+				return kParseError;
+			}
+			continue;
+		}
+
+		if (m_phase == kPhaseBodyTrailer) {
+			char c = data[consumed++];
+			if (c == '\n') {
+				if (!m_line.empty() && m_line[m_line.size() - 1] == '\r') {
+					m_line.erase(m_line.size() - 1);
+				}
+				if (m_line.empty()) {
+					m_phase = kPhaseDone;
+					return kParseComplete;
+				}
+				// Trailer field-line: discarded (not merged into headers).
+				m_line.clear();
+				continue;
+			}
+			m_line += c;
+			if (m_line.size() > 4096) {
+				setError(431, "trailer line too long");
+				return kParseError;
+			}
+			continue;
+		}
+		break; // unreachable
+	}
+	return kParseNeedMore;
 }
 
 } // namespace http
