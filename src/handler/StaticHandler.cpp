@@ -2,6 +2,7 @@
 
 #include "webserv/Log.hpp"
 #include "webserv/StringUtil.hpp"
+#include "webserv/handler/Autoindex.hpp"
 #include "webserv/http/Mime.hpp"
 
 #include <cerrno>
@@ -195,34 +196,61 @@ void serveStatic(const webserv::http::Request &req,
 		return;
 	}
 
-	// Directory: try index files, then autoindex (feat/16 will fill in),
-	// then 403.
+	// Directory: try index files first, then autoindex if enabled.
 	if (S_ISDIR(st.st_mode)) {
+		// Redirect a directory URL without a trailing slash so relative
+		// links inside the index / autoindex resolve correctly.
+		if (!relPath.empty() && relPath[relPath.size() - 1] != '/') {
+			response.setStatus(301);
+			response.setHeader("Location", relPath + "/");
+			response.setContentType("text/plain; charset=utf-8");
+			response.setBody("301 Moved Permanently\n");
+			return;
+		}
+
 		// Prefer location-level indexes if set, else server-level.
 		const std::vector<std::string> *indexes =
 			(match.location != NULL && !match.location->indexes.empty())
 			? &match.location->indexes
 			: &match.server->indexes;
+		bool autoindex = (match.location != NULL)
+		               ? match.location->autoindex
+		               : match.server->autoindex;
 
 		std::string idxPath;
-		if (indexes->empty()) {
-			// No index configured. Autoindex arrives in feat/16.
-			bool autoindex = (match.location != NULL)
-			               ? match.location->autoindex
-			               : match.server->autoindex;
-			if (autoindex) {
-				response.setStatus(501);
-				response.setBody("autoindex not implemented yet\n");
+		bool resolvedIndex = false;
+		if (!indexes->empty()) {
+			if (resolveIndex(fsPath, *indexes, idxPath) == 0) {
+				resolvedIndex = true;
+			}
+		}
+
+		if (!resolvedIndex) {
+			if (!autoindex) {
+				writeErrorBody(response, 403);
 				return;
 			}
-			writeErrorBody(response, 403);
+			std::string html;
+			int st_ai = renderAutoindex(fsPath, relPath, html);
+			if (st_ai != 0) {
+				writeErrorBody(response, st_ai);
+				return;
+			}
+			response.setStatus(200);
+			response.setContentType("text/html; charset=utf-8");
+			if (req.method == "HEAD") {
+				response.setHeader("Content-Length",
+				                   strutil::toStr(static_cast<long>(html.size())));
+				response.setBody(std::string());
+			} else {
+				response.setBody(html);
+			}
+			LOG_INFO("static: " << req.method << " " << req.path
+			         << " -> autoindex(" << fsPath << ", "
+			         << html.size() << "B)");
 			return;
 		}
-		int r = resolveIndex(fsPath, *indexes, idxPath);
-		if (r != 0) {
-			writeErrorBody(response, r);
-			return;
-		}
+
 		fsPath = idxPath;
 		if (::stat(fsPath.c_str(), &st) < 0) {
 			writeErrorBody(response, 404);
