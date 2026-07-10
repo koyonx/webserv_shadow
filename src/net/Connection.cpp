@@ -230,14 +230,19 @@ void Connection::onReadable(PollLoop &loop)
 		if (tryStartCgi(loop)) {
 			// CGI is running — response will be built when onCgiComplete
 			// fires and we'll pick up in kWritingResponse on the next
-			// tick.
+			// tick. CgiProcess owns its own deadline.
+			loop.clearDeadline(this);
 			return;
 		}
 		generateStubResponse();
 		m_state = kWritingResponse;
+		loop.setDeadline(this, m_idleMs);
 		return;
 	}
-	loop.setDeadline(this, m_idleMs);
+	// NOTE: we intentionally do NOT refresh the deadline on each read.
+	// The deadline was set when the state entered kReadingRequest
+	// (at accept, or after a keep-alive reset). Refreshing here would
+	// let a slow-loris client dribble one byte a second forever.
 }
 
 void Connection::onWritable(PollLoop &loop)
@@ -257,7 +262,10 @@ void Connection::onWritable(PollLoop &loop)
 		m_writePos += static_cast<std::size_t>(w);
 	}
 	if (m_writePos < m_writeBuf.size()) {
-		loop.setDeadline(this, m_idleMs);
+		// Same reasoning as onReadable: the deadline set at state
+		// entry (kWritingResponse) covers the whole response write;
+		// per-write refresh would allow a "slow reader" client to
+		// tie up the connection indefinitely.
 		return;
 	}
 
@@ -299,6 +307,9 @@ void Connection::onWritable(PollLoop &loop)
 			m_state = kWritingResponse;
 		}
 	}
+	// Fresh deadline for the next state (kReadingRequest for the next
+	// pipelined request, or kWritingResponse for its response). One
+	// deadline per state entry, not per event.
 	loop.setDeadline(this, m_idleMs);
 }
 
