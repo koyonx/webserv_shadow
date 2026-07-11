@@ -4,6 +4,7 @@
 #include "webserv/StringUtil.hpp"
 #include "webserv/handler/Autoindex.hpp"
 #include "webserv/handler/ErrorPage.hpp"
+#include "webserv/http/Conditional.hpp"
 #include "webserv/http/Mime.hpp"
 
 #include <cerrno>
@@ -210,6 +211,42 @@ void serveStatic(const webserv::http::Request &req,
 		return;
 	}
 
+	// Conditional GET / Range prep. We have `st` fully populated from
+	// the stat/fstat path above, and the file at `fsPath` is regular.
+	const std::size_t fileSize = static_cast<std::size_t>(st.st_size);
+	const std::string etag     = webserv::http::buildETag(fileSize, st.st_mtime);
+	const std::string lastMod  = webserv::http::httpDateFromTime(st.st_mtime);
+
+	// Every static response gets these headers so an intermediary /
+	// browser can cache and downstream tools see we support range.
+	response.setHeader("Last-Modified",  lastMod);
+	response.setHeader("ETag",           etag);
+	response.setHeader("Accept-Ranges", "bytes");
+
+	// If-None-Match / If-Modified-Since: 304 short-circuits body reads.
+	if (webserv::http::evaluatePreconditions(
+	        req.headers, st.st_mtime, etag)
+	    == webserv::http::kProceedNotModified) {
+		response.setStatus(304);
+		response.setBody(std::string());
+		LOG_INFO("static: " << req.method << " " << req.path
+		         << " -> " << fsPath << " (304 Not Modified)");
+		return;
+	}
+
+	// Range / If-Range.
+	webserv::http::RangeSpec   rspec;
+	webserv::http::RangeResult rres = webserv::http::parseRange(
+		req.headers, fileSize, st.st_mtime, etag, rspec);
+
+	if (rres == webserv::http::kRangeUnsatisfiable) {
+		std::ostringstream cr;
+		cr << "bytes */" << fileSize;
+		response.setHeader("Content-Range", cr.str());
+		writeErrorBody(response, 416, &match);
+		return;
+	}
+
 	std::string body;
 	int status = readWholeFile(fsPath, kMaxStaticFile, body);
 	if (status != 0) {
@@ -217,7 +254,18 @@ void serveStatic(const webserv::http::Request &req,
 		return;
 	}
 
-	response.setStatus(200);
+	if (rres == webserv::http::kRangeValid) {
+		std::size_t len = rspec.end - rspec.start + 1;
+		body = body.substr(rspec.start, len);
+		response.setStatus(206);
+		std::ostringstream cr;
+		cr << "bytes " << rspec.start << "-" << rspec.end
+		   << "/" << rspec.total;
+		response.setHeader("Content-Range", cr.str());
+	} else {
+		response.setStatus(200);
+	}
+
 	response.setContentType(webserv::http::mimeForFilename(fsPath));
 	// HEAD: same headers, empty body per RFC 7231.
 	if (req.method == "HEAD") {
@@ -229,7 +277,10 @@ void serveStatic(const webserv::http::Request &req,
 	}
 
 	LOG_INFO("static: " << req.method << " " << req.path
-	         << " -> " << fsPath << " (" << body.size() << "B)");
+	         << " -> " << fsPath
+	         << " (" << body.size() << "B"
+	         << (rres == webserv::http::kRangeValid ? " partial" : "")
+	         << ")");
 }
 
 } // namespace handler
