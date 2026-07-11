@@ -72,12 +72,56 @@ bool Router::locationPrefixMatches(const std::string &prefix,
 {
 	if (prefix.empty()) return false;
 	if (prefix == "/")  return true;
-	if (path.size() < prefix.size()) return false;
-	if (path.compare(0, prefix.size(), prefix) != 0) return false;
-	if (path.size() == prefix.size()) return true;
+
+	// Trailing-slash case: `/dir/` matches exact `/dir` too so the
+	// static handler can emit a 301 redirect that adds the missing
+	// slash (matches nginx).
+	std::size_t plen           = prefix.size();
+	bool        prefixHasTrail = (prefix[plen - 1] == '/');
+	if (prefixHasTrail
+	 && path.size() + 1 == plen
+	 && path.compare(0, path.size(), prefix, 0, path.size()) == 0) {
+		return true;
+	}
+
+	if (path.size() < plen)                       return false;
+	if (path.compare(0, plen, prefix) != 0)       return false;
+	if (path.size() == plen)                       return true;
 	// Boundary check: prefix "/api" must not match "/apix".
-	if (prefix[prefix.size() - 1] == '/') return true;
-	return path[prefix.size()] == '/';
+	if (prefixHasTrail)                            return true;
+	return path[plen] == '/';
+}
+
+std::string Router::stripLocationPrefix(const std::string &locationPath,
+                                        const std::string &normalizedPath)
+{
+	if (locationPath.empty() || locationPath == "/") {
+		return normalizedPath.empty() ? std::string("/") : normalizedPath;
+	}
+
+	std::size_t plen           = locationPath.size();
+	bool        prefixHasTrail = (locationPath[plen - 1] == '/');
+
+	// Exact match with the trailing-slash form: "/dir/" vs "/dir".
+	if (prefixHasTrail
+	 && normalizedPath.size() + 1 == plen
+	 && normalizedPath.compare(0, normalizedPath.size(),
+	                           locationPath, 0, normalizedPath.size()) == 0) {
+		return "/";
+	}
+
+	// Common prefix: peel it off.
+	if (normalizedPath.size() >= plen
+	 && normalizedPath.compare(0, plen, locationPath) == 0) {
+		std::string rest = normalizedPath.substr(plen);
+		if (rest.empty())                     return "/";
+		if (rest[0] != '/')                   rest = "/" + rest;
+		return rest;
+	}
+
+	// Fell through — path didn't actually start with the prefix
+	// (shouldn't happen if locationPrefixMatches was true earlier).
+	return normalizedPath.empty() ? std::string("/") : normalizedPath;
 }
 
 // -------- server selection --------

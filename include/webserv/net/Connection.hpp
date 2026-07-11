@@ -87,6 +87,18 @@ private:
 	webserv::http::RequestParser   m_parser;
 
 	webserv::cgi::CgiProcess      *m_cgi;   // owned during kRunningCgi
+
+	// "Graveyard" slot: onCgiComplete() runs from inside a PollLoop
+	// dispatch tick (via StdoutFd::onReadable). Deleting m_cgi there
+	// would free its inner StdinFd/StdoutFd handlers while PollLoop
+	// still holds pointers to them in m_handlers (pending removal is
+	// only drained at end-of-tick). To avoid the heap-use-after-free
+	// in rebuildPfds() on the NEXT tick — and any handler
+	// dereference after that — we stash the CgiProcess here and
+	// delete it on entry to the next Connection callback (onWritable
+	// or the destructor), by which time PollLoop has already dropped
+	// the pointers.
+	webserv::cgi::CgiProcess      *m_deadCgi;
 };
 
 } // namespace webserv

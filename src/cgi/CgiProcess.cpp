@@ -207,7 +207,6 @@ void CgiProcess::onStdoutReady(PollLoop &loop)
 
 void CgiProcess::tryFinish(PollLoop &loop)
 {
-	(void)loop;
 	if (m_finished)         return;
 	if (!m_stdoutClosed)    return;   // still receiving
 
@@ -227,6 +226,16 @@ void CgiProcess::tryFinish(PollLoop &loop)
 			}
 		}
 		m_pid = -1;
+	}
+	// Before invoking the callback (which may delete us), guarantee
+	// that PollLoop no longer has references to our pipe handlers.
+	// If the CGI exits before we finished writing its stdin, m_in is
+	// still registered — leaving it in the loop lets a subsequent tick
+	// call StdinFd::onReadable / onWritable on freed memory.
+	if (m_in != NULL && !m_stdinClosed) {
+		m_in->closeFd();
+		m_stdinClosed = true;
+		loop.remove(m_in);
 	}
 	int exitCode = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
 	reapAndCallback(exitCode);

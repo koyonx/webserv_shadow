@@ -41,6 +41,14 @@ public:
 	Response &setBody(const char *data, std::size_t len);
 	Response &setContentType(const std::string &mime);
 
+	// HEAD request: suppress the body from the wire but keep the
+	// Content-Length header reflecting the equivalent GET response
+	// (RFC 7231 §4.3.2). Centralizing this in Response avoids every
+	// handler needing an "if (method == HEAD) setBody(\"\")" branch,
+	// which is easy to forget on error paths — a missing check leaks
+	// bytes onto a keep-alive connection and desyncs the next response.
+	Response &setSuppressBody(bool suppress);
+
 	int    status()    const;
 	bool   keepAlive() const;
 
@@ -61,6 +69,7 @@ private:
 	HeaderList  m_headers;
 	std::string m_body;
 	bool        m_keepAlive;
+	bool        m_suppressBody;
 };
 
 const char *reasonPhrase(int status);

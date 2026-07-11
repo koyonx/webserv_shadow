@@ -126,7 +126,15 @@ void serveStatic(const webserv::http::Request &req,
 		writeErrorBody(response, 500, &match);
 		return;
 	}
-	std::string relPath = match.normalizedPath.empty() ? "/" : match.normalizedPath;
+	// Subject-correct root: strip the location's prefix from the URL
+	// before joining with root. Example from the subject: /kapouet
+	// rooted at /tmp/www serves /kapouet/pouic/toto/pouet from
+	// /tmp/www/pouic/toto/pouet — i.e., alias-style, not append.
+	const std::string &locPath = (match.location != NULL)
+	                             ? match.location->path
+	                             : std::string("/");
+	std::string relPath = webserv::Router::stripLocationPrefix(
+		locPath, match.normalizedPath);
 	std::string fsPath  = joinPath(root, relPath);
 
 	struct stat st;
@@ -148,9 +156,13 @@ void serveStatic(const webserv::http::Request &req,
 	if (S_ISDIR(st.st_mode)) {
 		// Redirect a directory URL without a trailing slash so relative
 		// links inside the index / autoindex resolve correctly.
-		if (!relPath.empty() && relPath[relPath.size() - 1] != '/') {
+		// Use the full request path (match.normalizedPath), NOT the
+		// alias-stripped relPath — otherwise the Location header drops
+		// the location prefix (e.g. /directory/nop -> Location: /nop/).
+		const std::string &reqPath = match.normalizedPath;
+		if (!reqPath.empty() && reqPath[reqPath.size() - 1] != '/') {
 			response.setStatus(301);
-			response.setHeader("Location", relPath + "/");
+			response.setHeader("Location", reqPath + "/");
 			response.setContentType("text/plain; charset=utf-8");
 			response.setBody("301 Moved Permanently\n");
 			return;
@@ -175,7 +187,13 @@ void serveStatic(const webserv::http::Request &req,
 
 		if (!resolvedIndex) {
 			if (!autoindex) {
-				writeErrorBody(response, 403, &match);
+				// No index resolved and no autoindex: the subject wording
+				// for /directory/ is "if no file are requested, it should
+				// search for youpi.bad_extension files" — i.e. absence of
+				// the index is a not-found condition, not a permission
+				// error. 404 matches the 42 tester's expectation and
+				// still round-trips through error_page handling.
+				writeErrorBody(response, 404, &match);
 				return;
 			}
 			std::string html;

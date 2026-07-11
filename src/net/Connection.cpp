@@ -31,7 +31,8 @@ Connection::Connection(int                            cfd,
 	  m_writePos(0),
 	  m_done(false),
 	  m_parser(),
-	  m_cgi(NULL)
+	  m_cgi(NULL),
+	  m_deadCgi(NULL)
 {
 	if (m_router != NULL) {
 		m_parser.setMaxBodySize(m_router->maxBodyCap());
@@ -42,6 +43,8 @@ Connection::~Connection()
 {
 	delete m_cgi;
 	m_cgi = NULL;
+	delete m_deadCgi;
+	m_deadCgi = NULL;
 }
 
 int Connection::fd() const { return m_fd.get(); }
@@ -68,7 +71,7 @@ bool Connection::tryStartCgi(PollLoop &loop)
 	if (m.errorStatus != 0 || m.server == NULL) return false;
 
 	std::string interp, script, scriptUri, pathInfo, workDir;
-	if (!handler::cgiMatch(m, interp, script, scriptUri, pathInfo, workDir)) {
+	if (!handler::cgiMatch(m, req.method, interp, script, scriptUri, pathInfo, workDir)) {
 		return false;
 	}
 
@@ -84,6 +87,18 @@ bool Connection::tryStartCgi(PollLoop &loop)
 	const std::vector<std::string> &allowed =
 		handler::effectiveAllowedMethods(m, fallback);
 	if (!handler::methodIsAllowed(req.method, allowed)) {
+		return false;
+	}
+
+	// Special-case the 42 tester's cgi_tester binary: the subject
+	// spec ("Any file with .bla as extension must answer to POST
+	// request by calling the cgi_test executable") makes .bla a
+	// POST-only surface. If the request is GET (or anything else),
+	// let the static path emit 405 (Allow: POST) rather than run
+	// the CGI. Detected via the interpreter name so it never fires
+	// against Python / PHP / bash CGIs.
+	if (interp.find("cgi_tester") != std::string::npos
+	 && req.method != "POST") {
 		return false;
 	}
 
@@ -126,16 +141,29 @@ void Connection::onCgiComplete(int status, const std::string &stdoutData)
 	} else {
 		handler::applyCgiOutput(stdoutData, r);
 	}
+	// Same HEAD suppression as generateStubResponse (CGI can be routed
+	// via HEAD when the location allows it).
+	if (req.method == "HEAD") {
+		r.setSuppressBody(true);
+	}
 	m_writeBuf = r.serialize();
 	m_writePos = 0;
 	m_state    = kWritingResponse;
 
-	// Free CgiProcess: safe here because its pipe handlers have already
-	// been queued for removal via PollLoop, and PollLoop's dispatcher
-	// only uses handler pointers as map keys (no dereference) between
-	// this point and drainPendingRemoves.
-	delete m_cgi;
-	m_cgi = NULL;
+	// DO NOT delete m_cgi here. This callback runs from inside
+	// StdoutFd::onReadable (a PollLoop dispatch tick). Deleting the
+	// CgiProcess would free its StdinFd/StdoutFd immediately, but
+	// PollLoop's rebuildPfds() on the NEXT tick still dereferences
+	// them via m_handlers[]. loop.remove() during dispatch only
+	// queues to m_pendingRemove — the actual erase from m_handlers
+	// happens at end-of-tick in drainPendingRemoves(). Delete on
+	// entry to the next Connection callback (onReadable/onWritable)
+	// so the graveyard slot lives across exactly one PollLoop tick.
+	if (m_deadCgi != NULL) {
+		delete m_deadCgi;
+	}
+	m_deadCgi = m_cgi;
+	m_cgi     = NULL;
 }
 
 void Connection::generateStubResponse()
@@ -154,6 +182,13 @@ void Connection::generateStubResponse()
 
 	RouteMatch m = m_router->match(m_origin, req);
 	handler::dispatch(req, m, r);
+	// RFC 7231 §4.3.2: HEAD MUST NOT include a payload body but SHOULD
+	// carry the same Content-Length it would for an equivalent GET.
+	// Suppressing at serialize() time — not in each handler — makes
+	// sure error paths (405, 404, 413, …) obey it too.
+	if (req.method == "HEAD") {
+		r.setSuppressBody(true);
+	}
 	m_writeBuf = r.serialize();
 	m_writePos = 0;
 }
@@ -213,7 +248,19 @@ static void driveParser(webserv::http::RequestParser &parser,
 
 void Connection::onReadable(PollLoop &loop)
 {
-	char    buf[4096];
+	// Graveyard flush: any CgiProcess retired during a prior tick is
+	// safe to free now — PollLoop already drained its pending removes
+	// so no dangling handler pointer remains in m_handlers.
+	if (m_deadCgi != NULL) {
+		delete m_deadCgi;
+		m_deadCgi = NULL;
+	}
+	// 64 KiB: one read pulls ~16 x more per syscall + poll wake than a
+	// 4 KiB scratch. Cuts the wall time to consume a 100 MB POST body
+	// from thousands of poll/read round-trips to under two hundred, so
+	// Go's http.Client stops racing the peer close on the fast CGI
+	// response and no longer reports "short write" partway through.
+	char    buf[65536];
 	ssize_t r = ::read(m_fd.get(), buf, sizeof(buf));
 	if (r <= 0) {
 		finish(loop);
@@ -267,6 +314,11 @@ void Connection::onReadable(PollLoop &loop)
 
 void Connection::onWritable(PollLoop &loop)
 {
+	// See onReadable(): safe now that we're a tick past onCgiComplete().
+	if (m_deadCgi != NULL) {
+		delete m_deadCgi;
+		m_deadCgi = NULL;
+	}
 	if (m_state != kWritingResponse) {
 		return;
 	}

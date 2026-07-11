@@ -66,7 +66,8 @@ Response::Response()
 	  m_reason(),
 	  m_headers(),
 	  m_body(),
-	  m_keepAlive(false)
+	  m_keepAlive(false),
+	  m_suppressBody(false)
 {}
 
 void Response::clear()
@@ -77,6 +78,7 @@ void Response::clear()
 	m_headers.clear();
 	m_body.clear();
 	m_keepAlive = false;
+	m_suppressBody = false;
 }
 
 Response &Response::setVersion(const Version &v) { m_version   = v; return *this; }
@@ -118,6 +120,12 @@ Response &Response::setBody(const char *data, std::size_t len)
 Response &Response::setContentType(const std::string &mime)
 {
 	return setHeader("Content-Type", mime);
+}
+
+Response &Response::setSuppressBody(bool suppress)
+{
+	m_suppressBody = suppress;
+	return *this;
 }
 
 int  Response::status()    const { return m_status; }
@@ -172,7 +180,12 @@ std::string Response::serialize() const
 	}
 
 	oss << "\r\n";
-	oss << m_body;
+	// HEAD (or any 1xx/204/304): headers only. Content-Length above
+	// still advertises the body size the equivalent GET would have
+	// returned, per RFC 7231 §4.3.2.
+	if (!m_suppressBody) {
+		oss << m_body;
+	}
 	return oss.str();
 }
 

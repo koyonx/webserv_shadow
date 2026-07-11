@@ -14,6 +14,7 @@ namespace handler {
 // as CGI. Returns true and fills the outputs when the request's path
 // extension appears in the location's cgi_pass map.
 bool cgiMatch(const webserv::RouteMatch &match,
+              const std::string         &method,
               std::string               &interpreterOut,
               std::string               &scriptPathOut,
               std::string               &scriptUriOut,

@@ -10,8 +10,16 @@ const std::vector<std::string> &effectiveAllowedMethods(
 	if (match.location != NULL && !match.location->allowedMethods.empty()) {
 		return match.location->allowedMethods;
 	}
+	// Default fallback when the location omits allowed_methods.
+	// HEAD is included so a bare "no allowed_methods set" location
+	// still honors HEAD like nginx does; when the operator DOES
+	// declare `allowed_methods GET;` explicitly, we treat "GET" as
+	// literally "GET only" — no implicit HEAD — so tester spec
+	// "/ must answer to GET request ONLY" (`./testers/tester`) is
+	// satisfied.
 	fallback.clear();
 	fallback.push_back("GET");
+	fallback.push_back("HEAD");
 	fallback.push_back("POST");
 	fallback.push_back("DELETE");
 	return fallback;
@@ -20,9 +28,12 @@ const std::vector<std::string> &effectiveAllowedMethods(
 bool methodIsAllowed(const std::string              &method,
                      const std::vector<std::string> &allowed)
 {
+	// Strict membership check. HEAD used to auto-map to GET; we now
+	// require the operator to opt in with `allowed_methods GET HEAD;`
+	// when a location wants both. This matches the 42 tester's
+	// literal reading of "GET request ONLY".
 	for (std::size_t i = 0; i < allowed.size(); ++i) {
-		if (allowed[i] == method)                    return true;
-		if (method == "HEAD" && allowed[i] == "GET") return true;
+		if (allowed[i] == method) return true;
 	}
 	return false;
 }
