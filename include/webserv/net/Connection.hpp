@@ -37,6 +37,13 @@ public:
 	enum State {
 		kReadingRequest,
 		kRunningCgi,
+		// Response headers + a partial chunked body have been queued
+		// or already flushed to the client, but the CGI child is
+		// still producing output. m_writeBuf keeps growing (bounded
+		// by write-side drain + soft cap) as onCgiBodyChunk chunk-
+		// frames each stdout read; onCgiEnd terminates the chunked
+		// stream and flips us to kWritingResponse for the tail flush.
+		kStreamingCgiToClient,
 		kWritingResponse,
 		kClosing
 	};
@@ -102,14 +109,24 @@ private:
 	// the pointers.
 	webserv::cgi::CgiProcess      *m_deadCgi;
 
-	// Streaming CGI state. Set up at onCgiHeaders time and torn
-	// down at onCgiEnd. S1 keeps behavior identical to the pre-
-	// split code (buffer everything, apply at end); S5 will
-	// replace this with real chunked-response streaming so a
-	// 100 MB CGI body no longer sits in memory.
+	// Streaming CGI state.
+	//
+	// m_cgiStreaming picks the response path at onCgiHeaders time:
+	//   true  -> Transfer-Encoding: chunked, body flows to
+	//            m_writeBuf via chunkFrame() and the socket writer
+	//            drains it in parallel with the CGI still producing.
+	//            m_cgiBodyBuf stays empty. This is the S5 fast path
+	//            that lets a 100 MB CGI echo body stay off the heap.
+	//   false -> "buffered" fallback for HEAD (needs Content-Length
+	//            reflecting the equivalent GET body size) or for
+	//            malformed CGI output (we replace the response with
+	//            a 502). Body accumulates in m_cgiBodyBuf and the
+	//            final response is assembled in onCgiEnd — the S1
+	//            behaviour.
 	std::string                    m_cgiHeaderBlock;
 	std::string                    m_cgiBodyBuf;
 	bool                           m_cgiHeadersSeen;
+	bool                           m_cgiStreaming;
 };
 
 } // namespace webserv
