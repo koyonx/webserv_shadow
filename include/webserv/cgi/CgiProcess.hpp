@@ -119,7 +119,15 @@ private:
 	std::vector<std::string>  m_env;
 	std::string               m_body;
 	std::size_t               m_bodyPos;
-	std::string               m_output;
+	// Header pre-buffer. Once the \r\n\r\n terminator is spotted we
+	// fire onCgiHeaders and stop accumulating — subsequent stdout
+	// reads flow straight through to onCgiBodyChunk. Capped so a
+	// runaway CGI that emits headers forever can't OOM the server.
+	std::string               m_headerBuf;
+	bool                      m_headersFired;
+	bool                      m_headerMalformed;
+	std::size_t               m_headerCapBytes;
+	std::size_t               m_bodyStreamedBytes;
 
 	pid_t                     m_pid;
 	ICgiCallback             &m_cb;
