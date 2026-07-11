@@ -40,7 +40,13 @@ int readWholeFile(const std::string &path,
 	int fd = ::open(path.c_str(), O_RDONLY);
 	if (fd < 0) {
 		int err = errno;
+		// M1: ENAMETOOLONG surfaces when the URI is longer than the
+		// filesystem allows -> 414 (URI Too Long) rather than 500.
+		// ELOOP means a symlink cycle -> 404 (as if it didn't exist).
+		// ENOENT/ENOTDIR are the ordinary "no such file" cases.
+		if (err == ENAMETOOLONG)             return 414;
 		if (err == ENOENT || err == ENOTDIR) return 404;
+		if (err == ELOOP)                    return 404;
 		if (err == EACCES || err == EPERM)   return 403;
 		return 500;
 	}
@@ -125,9 +131,15 @@ void serveStatic(const webserv::http::Request &req,
 	struct stat st;
 	if (::stat(fsPath.c_str(), &st) < 0) {
 		int err = errno;
-		writeErrorBody(response,
-		               (err == ENOENT || err == ENOTDIR) ? 404 : 500,
-		               &match);
+		int status;
+		// M1: keep 5xx for real server-side problems only. Long/looped
+		// URIs and permission errors are client-side conditions.
+		if (err == ENAMETOOLONG)              status = 414;
+		else if (err == ENOENT || err == ENOTDIR
+		      || err == ELOOP)                 status = 404;
+		else if (err == EACCES || err == EPERM) status = 403;
+		else                                    status = 500;
+		writeErrorBody(response, status, &match);
 		return;
 	}
 

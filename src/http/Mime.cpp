@@ -38,7 +38,28 @@ const MimeEntry kTable[] = {
 	{ ".zip",  "application/zip"                 },
 	{ ".gz",   "application/gzip"                },
 	{ ".tar",  "application/x-tar"               },
-	{ ".wasm", "application/wasm"                }
+	{ ".wasm", "application/wasm"                },
+	// Fonts — added for I4 in the test report.
+	{ ".woff", "font/woff"                       },
+	{ ".woff2","font/woff2"                      },
+	{ ".ttf",  "font/ttf"                        },
+	{ ".otf",  "font/otf"                        },
+	{ ".eot",  "application/vnd.ms-fontobject"   },
+	// Extra image types testers sometimes probe.
+	{ ".bmp",  "image/bmp"                       },
+	{ ".tif",  "image/tiff"                      },
+	{ ".tiff", "image/tiff"                      },
+	{ ".avif", "image/avif"                      },
+	// Multimedia extras.
+	{ ".ogg",  "audio/ogg"                       },
+	{ ".wav",  "audio/wav"                       },
+	{ ".flac", "audio/flac"                      },
+	{ ".webm", "video/webm"                      },
+	{ ".mkv",  "video/x-matroska"                },
+	// Text extras.
+	{ ".csv",  "text/csv; charset=utf-8"         },
+	{ ".yaml", "text/yaml; charset=utf-8"        },
+	{ ".yml",  "text/yaml; charset=utf-8"        }
 };
 const std::size_t kTableSize = sizeof(kTable) / sizeof(kTable[0]);
 

@@ -120,10 +120,29 @@ void applyCgiOutput(const std::string       &raw,
 			headerBlock = raw.substr(offset, endHdr2 - offset);
 			bodyStart   = endHdr2 + 2;
 		} else {
-			// No headers, whole thing is body — default text/html.
-			response.setStatus(200);
-			response.setContentType("text/html; charset=utf-8");
-			response.setBody(raw.substr(offset));
+			// L1: CGI RFC 3875 §6 requires at least a Content-Type
+			// header terminated by an empty line. Missing terminator
+			// means the script is malformed — respond 502 Bad Gateway
+			// instead of a bare 200 with the raw bytes.
+			response.setStatus(502);
+			response.setContentType("text/plain; charset=utf-8");
+			response.setBody("502 Bad Gateway (CGI: missing header terminator)\n");
+			return;
+		}
+	}
+
+	// L1 continued: even with a terminator, at least one header line
+	// must parse as "name: value" for the response to be considered
+	// a valid CGI response. An empty header block is malformed.
+	{
+		bool hasHeader = false;
+		for (std::size_t k = 0; k < headerBlock.size(); ++k) {
+			if (headerBlock[k] == ':') { hasHeader = true; break; }
+		}
+		if (!hasHeader) {
+			response.setStatus(502);
+			response.setContentType("text/plain; charset=utf-8");
+			response.setBody("502 Bad Gateway (CGI: no header fields)\n");
 			return;
 		}
 	}

@@ -6,6 +6,7 @@
 #include "webserv/core/PollLoop.hpp"
 #include "webserv/handler/CgiHandler.hpp"
 #include "webserv/handler/Dispatch.hpp"
+#include "webserv/handler/MethodPolicy.hpp"
 #include "webserv/http/Response.hpp"
 #include "webserv/net/Router.hpp"
 
@@ -68,6 +69,21 @@ bool Connection::tryStartCgi(PollLoop &loop)
 
 	std::string interp, script, scriptUri, pathInfo, workDir;
 	if (!handler::cgiMatch(m, interp, script, scriptUri, pathInfo, workDir)) {
+		return false;
+	}
+
+	// H1 fix: enforce the location's allowed_methods BEFORE spawning
+	// the CGI. Previously any method (DELETE, PUT, PATCH, TRACE, FROB, ...)
+	// reached the CGI because the check only ran inside Dispatch and CGI
+	// was routed earlier. Returning false here lets Dispatch produce
+	// 405 (with an accurate Allow header) or 501 depending on the method.
+	if (!handler::methodIsImplemented(req.method)) {
+		return false;
+	}
+	std::vector<std::string>        fallback;
+	const std::vector<std::string> &allowed =
+		handler::effectiveAllowedMethods(m, fallback);
+	if (!handler::methodIsAllowed(req.method, allowed)) {
 		return false;
 	}
 

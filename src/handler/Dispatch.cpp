@@ -3,49 +3,12 @@
 #include "webserv/StringUtil.hpp"
 #include "webserv/handler/DeleteHandler.hpp"
 #include "webserv/handler/ErrorPage.hpp"
+#include "webserv/handler/MethodPolicy.hpp"
 #include "webserv/handler/PostHandler.hpp"
 #include "webserv/handler/StaticHandler.hpp"
 
 namespace webserv {
 namespace handler {
-
-namespace {
-
-const std::vector<std::string> &effectiveAllowedMethods(
-	const webserv::RouteMatch &match,
-	std::vector<std::string>  &fallback)
-{
-	if (match.location != NULL && !match.location->allowedMethods.empty()) {
-		return match.location->allowedMethods;
-	}
-	fallback.clear();
-	fallback.push_back("GET");
-	fallback.push_back("POST");
-	fallback.push_back("DELETE");
-	return fallback;
-}
-
-bool methodIsAllowed(const std::string              &method,
-                    const std::vector<std::string> &allowed)
-{
-	for (std::size_t i = 0; i < allowed.size(); ++i) {
-		if (allowed[i] == method)                  return true;
-		if (method == "HEAD" && allowed[i] == "GET") return true;
-	}
-	return false;
-}
-
-std::string allowHeader(const std::vector<std::string> &allowed)
-{
-	std::string out;
-	for (std::size_t i = 0; i < allowed.size(); ++i) {
-		if (i > 0) out += ", ";
-		out += allowed[i];
-	}
-	return out;
-}
-
-} // anonymous
 
 void dispatch(const webserv::http::Request &req,
               const webserv::RouteMatch    &match,
@@ -61,9 +24,19 @@ void dispatch(const webserv::http::Request &req,
 		return;
 	}
 
-	// Method policy: location wins, otherwise default {GET, POST, DELETE}.
+	// Method policy split into two stages:
+	//   1. methodIsImplemented — GET/HEAD/POST/DELETE. Anything else
+	//      (PUT, PATCH, TRACE, OPTIONS, FROB, ...) is "not implemented"
+	//      by webserv per RFC 7231 §6.6.2 -> 501.
+	//   2. methodIsAllowed — the location's allow list. A known method
+	//      that isn't permitted here gets 405 with an Allow header.
+	if (!methodIsImplemented(req.method)) {
+		emitError(501, &match, response);
+		return;
+	}
 	std::vector<std::string>        fallback;
-	const std::vector<std::string> &allowed = effectiveAllowedMethods(match, fallback);
+	const std::vector<std::string> &allowed =
+		effectiveAllowedMethods(match, fallback);
 	if (!methodIsAllowed(req.method, allowed)) {
 		response.setHeader("Allow", allowHeader(allowed));
 		emitError(405, &match, response);
@@ -96,7 +69,10 @@ void dispatch(const webserv::http::Request &req,
 		return;
 	}
 
-	// Method-specific handlers.
+	// Method-specific handlers. methodIsImplemented above guarantees
+	// we only reach one of these arms — the final emitError(501) is
+	// defensive dead-code (kept because a future method addition
+	// would otherwise return an empty response).
 	if (req.method == "GET" || req.method == "HEAD") {
 		serveStatic(req, match, response);
 		return;
