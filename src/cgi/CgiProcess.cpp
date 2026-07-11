@@ -247,7 +247,33 @@ void CgiProcess::reapAndCallback(int status)
 	m_finished = true;
 	LOG_INFO("cgi: exit status=" << status
 	         << " output=" << m_output.size() << "B");
-	m_cb.onCgiComplete(status, m_output);
+
+	// S1: interface split only — behaviour identical to the old
+	// single-callback path. Locate the CRLFCRLF (or LFLF) terminator
+	// in the collected m_output, hand the header block up via
+	// onCgiHeaders, hand the body up via a single onCgiBodyChunk,
+	// then onCgiEnd. Malformed output (no terminator) still gets
+	// caught here: we fire onCgiHeaders("") + onCgiEnd(status) and
+	// let Connection emit 502. S3 will drop m_output entirely and
+	// fire onCgiHeaders as soon as the terminator is seen on the
+	// wire, plus onCgiBodyChunk for every subsequent stdout read.
+	std::string::size_type end = m_output.find("\r\n\r\n");
+	std::size_t sepLen = 4;
+	if (end == std::string::npos) {
+		end = m_output.find("\n\n");
+		sepLen = 2;
+	}
+	if (end == std::string::npos) {
+		m_cb.onCgiHeaders(std::string());
+	} else {
+		m_cb.onCgiHeaders(m_output.substr(0, end));
+		std::size_t bodyStart = end + sepLen;
+		if (bodyStart < m_output.size()) {
+			m_cb.onCgiBodyChunk(m_output.data() + bodyStart,
+			                    m_output.size() - bodyStart);
+		}
+	}
+	m_cb.onCgiEnd(status);
 }
 
 void CgiProcess::onDeadlineExpired(PollLoop &loop)

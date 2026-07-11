@@ -32,7 +32,10 @@ Connection::Connection(int                            cfd,
 	  m_done(false),
 	  m_parser(),
 	  m_cgi(NULL),
-	  m_deadCgi(NULL)
+	  m_deadCgi(NULL),
+	  m_cgiHeaderBlock(),
+	  m_cgiBodyBuf(),
+	  m_cgiHeadersSeen(false)
 {
 	if (m_router != NULL) {
 		m_parser.setMaxBodySize(m_router->maxBodyCap());
@@ -124,22 +127,66 @@ bool Connection::tryStartCgi(PollLoop &loop)
 	return true;
 }
 
-void Connection::onCgiComplete(int status, const std::string &stdoutData)
+// -------- Streaming CGI callback surface (S1 shape).
+//
+// S1 preserves the pre-split "buffer everything, apply at end"
+// behaviour: onCgiHeaders / onCgiBodyChunk record inputs into
+// per-request scratch strings, and onCgiEnd assembles the final
+// Response the same way onCgiComplete used to. S3/S5 will replace
+// the in-onCgiEnd assembly with genuine chunk-by-chunk streaming
+// out to the client — the interface here is what makes that
+// possible without touching CgiProcess again.
+
+void Connection::onCgiHeaders(const std::string &headerBlock)
+{
+	m_cgiHeaderBlock = headerBlock;
+	m_cgiHeadersSeen = true;
+}
+
+void Connection::onCgiBodyChunk(const char *data, std::size_t len)
+{
+	if (len > 0) {
+		m_cgiBodyBuf.append(data, len);
+	}
+}
+
+void Connection::onCgiEnd(int exitStatus)
 {
 	const webserv::http::Request &req = m_parser.request();
 	webserv::http::Response r;
 	r.setKeepAlive(req.keepAlive);
 
-	if (status < 0) {
+	if (exitStatus < 0) {
+		// Timeout / kill / exec failure — headers may or may not have
+		// been seen; either way we can still emit 504 because we
+		// haven't sent anything to the client yet in the S1 buffered
+		// path. (S5 will need to distinguish: if headers were already
+		// flushed to the wire we can only close the connection.)
 		r.setStatus(504);
 		r.setContentType("text/plain; charset=utf-8");
 		r.setBody("504 Gateway Timeout\n");
-	} else if (status != 0 && stdoutData.empty()) {
+	} else if (!m_cgiHeadersSeen) {
+		// No terminator seen in CGI stdout — malformed per L1.
+		r.setStatus(502);
+		r.setContentType("text/plain; charset=utf-8");
+		r.setBody("502 Bad Gateway\n");
+	} else if (exitStatus != 0 && m_cgiBodyBuf.empty()
+	           && m_cgiHeaderBlock.empty()) {
+		// Non-zero exit with no output at all — treat as bad gateway.
 		r.setStatus(502);
 		r.setContentType("text/plain; charset=utf-8");
 		r.setBody("502 Bad Gateway\n");
 	} else {
-		handler::applyCgiOutput(stdoutData, r);
+		// Recombine and reuse the legacy applyCgiOutput path so
+		// header parsing (Status:, Location:, Set-Cookie, ...)
+		// stays canonical. S4 will factor out a parseCgiHeaders
+		// primitive that the streaming path in S5 shares.
+		std::string raw;
+		raw.reserve(m_cgiHeaderBlock.size() + 4 + m_cgiBodyBuf.size());
+		raw.append(m_cgiHeaderBlock);
+		raw.append("\r\n\r\n", 4);
+		raw.append(m_cgiBodyBuf);
+		handler::applyCgiOutput(raw, r);
 	}
 	// Same HEAD suppression as generateStubResponse (CGI can be routed
 	// via HEAD when the location allows it).
@@ -149,6 +196,10 @@ void Connection::onCgiComplete(int status, const std::string &stdoutData)
 	m_writeBuf = r.serialize();
 	m_writePos = 0;
 	m_state    = kWritingResponse;
+
+	// Clear per-request CGI scratch. m_cgiHeadersSeen stays true so a
+	// future S5 assertion can detect double-onCgiEnd; it's reset when
+	// the connection next parses a new request (keep-alive path).
 
 	// DO NOT delete m_cgi here. This callback runs from inside
 	// StdoutFd::onReadable (a PollLoop dispatch tick). Deleting the
@@ -356,6 +407,11 @@ void Connection::onWritable(PollLoop &loop)
 	m_writeBuf.clear();
 	m_writePos = 0;
 	m_state    = kReadingRequest;
+	// CGI scratch belongs to the just-finished request. Clear it so
+	// the next request over the same connection starts fresh.
+	m_cgiHeaderBlock.clear();
+	m_cgiBodyBuf.clear();
+	m_cgiHeadersSeen = false;
 
 	if (!m_readBuf.empty()) {
 		bool parseError = false, complete = false;
