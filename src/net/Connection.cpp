@@ -10,7 +10,10 @@
 #include "webserv/http/Response.hpp"
 #include "webserv/net/Router.hpp"
 
+#include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <poll.h>
+#include <sys/socket.h>
 #include <unistd.h>
 
 namespace webserv {
@@ -372,6 +375,20 @@ void Connection::onReadable(PollLoop &loop)
 	// response and no longer reports "short write" partway through.
 	char    buf[65536];
 	ssize_t r = ::read(m_fd.get(), buf, sizeof(buf));
+#ifdef TCP_QUICKACK
+	// TCP_QUICKACK is one-shot on Linux — the kernel silently reverts
+	// to delayed-ACK once a few packets go by. Re-arming after every
+	// read keeps the peer's chunk-per-write upload from stalling in
+	// 40 ms increments (Go's http.Client hits this on 100 MB chunked
+	// POST bodies over localhost; without this the tester times out
+	// even though the server is idle). Best-effort — ignore errors
+	// (BSD lacks TCP_QUICKACK).
+	if (r > 0) {
+		int one = 1;
+		(void)::setsockopt(m_fd.get(), IPPROTO_TCP, TCP_QUICKACK,
+		                   &one, sizeof(one));
+	}
+#endif
 	if (r <= 0) {
 		finish(loop);
 		return;
@@ -416,10 +433,15 @@ void Connection::onReadable(PollLoop &loop)
 		loop.setDeadline(this, m_idleMs);
 		return;
 	}
-	// NOTE: we intentionally do NOT refresh the deadline on each read.
-	// The deadline was set when the state entered kReadingRequest
-	// (at accept, or after a keep-alive reset). Refreshing here would
-	// let a slow-loris client dribble one byte a second forever.
+	// Refresh the idle deadline on every read that made progress.
+	// The alternative — a single deadline set at state entry — kills
+	// a legitimate 100 MB upload that took more than m_idleMs even
+	// though the client was continuously making progress. Slow-loris
+	// protection needs a max-time budget which is a separate hardening
+	// item; for now, refresh on progress.
+	if (r > 0) {
+		loop.setDeadline(this, m_idleMs);
+	}
 }
 
 void Connection::onWritable(PollLoop &loop)
