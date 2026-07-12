@@ -1,6 +1,7 @@
 #include "webserv/http/Response.hpp"
 
 #include "webserv/StringUtil.hpp"
+#include "webserv/http/Conditional.hpp"
 
 #include <ctime>
 #include <iomanip>
@@ -37,6 +38,7 @@ const char *reasonPhrase(int status)
 		case 413: return "Payload Too Large";
 		case 414: return "URI Too Long";
 		case 415: return "Unsupported Media Type";
+		case 416: return "Range Not Satisfiable";
 		case 431: return "Request Header Fields Too Large";
 		case 500: return "Internal Server Error";
 		case 501: return "Not Implemented";
@@ -50,25 +52,10 @@ const char *reasonPhrase(int status)
 
 std::string httpDateNow()
 {
-	// Locale-independent IMF-fixdate: "Sun, 06 Nov 1994 08:49:37 GMT"
-	static const char *dow[] = {"Sun","Mon","Tue","Wed","Thu","Fri","Sat"};
-	static const char *mon[] = {"Jan","Feb","Mar","Apr","May","Jun",
-	                            "Jul","Aug","Sep","Oct","Nov","Dec"};
-
-	std::time_t  now = std::time(NULL);
-	std::tm     *tm  = std::gmtime(&now);
-	if (tm == NULL) {
-		return "Thu, 01 Jan 1970 00:00:00 GMT";
-	}
-	std::ostringstream oss;
-	oss << dow[tm->tm_wday] << ", "
-	    << std::setfill('0') << std::setw(2) << tm->tm_mday << ' '
-	    << mon[tm->tm_mon]   << ' '
-	    << (tm->tm_year + 1900) << ' '
-	    << std::setw(2) << tm->tm_hour << ':'
-	    << std::setw(2) << tm->tm_min  << ':'
-	    << std::setw(2) << tm->tm_sec  << " GMT";
-	return oss.str();
+	// Delegates to httpDateFromTime() in Conditional so we have a single
+	// locale-independent IMF-fixdate formatter shared by Date, ETag
+	// checks, and Last-Modified.
+	return httpDateFromTime(std::time(NULL));
 }
 
 // ---------------------- Response ----------------------
@@ -79,7 +66,8 @@ Response::Response()
 	  m_reason(),
 	  m_headers(),
 	  m_body(),
-	  m_keepAlive(false)
+	  m_keepAlive(false),
+	  m_suppressBody(false)
 {}
 
 void Response::clear()
@@ -90,6 +78,7 @@ void Response::clear()
 	m_headers.clear();
 	m_body.clear();
 	m_keepAlive = false;
+	m_suppressBody = false;
 }
 
 Response &Response::setVersion(const Version &v) { m_version   = v; return *this; }
@@ -131,6 +120,12 @@ Response &Response::setBody(const char *data, std::size_t len)
 Response &Response::setContentType(const std::string &mime)
 {
 	return setHeader("Content-Type", mime);
+}
+
+Response &Response::setSuppressBody(bool suppress)
+{
+	m_suppressBody = suppress;
+	return *this;
 }
 
 int  Response::status()    const { return m_status; }
@@ -185,7 +180,12 @@ std::string Response::serialize() const
 	}
 
 	oss << "\r\n";
-	oss << m_body;
+	// HEAD (or any 1xx/204/304): headers only. Content-Length above
+	// still advertises the body size the equivalent GET would have
+	// returned, per RFC 7231 §4.3.2.
+	if (!m_suppressBody) {
+		oss << m_body;
+	}
 	return oss.str();
 }
 

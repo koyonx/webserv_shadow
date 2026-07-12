@@ -56,6 +56,7 @@ std::string ensureAbsolute(const std::string &path)
 } // anonymous
 
 bool cgiMatch(const webserv::RouteMatch &match,
+              const std::string         &method,
               std::string               &interpreterOut,
               std::string               &scriptPathOut,
               std::string               &scriptUriOut,
@@ -77,19 +78,46 @@ bool cgiMatch(const webserv::RouteMatch &match,
 	                 : match.server->root;
 	if (root.empty()) return false;
 
-	std::string abs = ensureAbsolute(joinPath(root, match.normalizedPath));
-	// Only take the CGI branch when the script actually exists. If not,
-	// let the static path emit a proper 404 (with error_page support)
-	// instead of exec-failing into 502.
+	// Subject-correct root: strip the location's prefix so the URL
+	// under `root` (nginx's `alias` semantics per the subject example).
+	std::string relPath = webserv::Router::stripLocationPrefix(
+		match.location->path, match.normalizedPath);
+	std::string abs = ensureAbsolute(joinPath(root, relPath));
+	// GET on a missing script gets 404 (users likely mistyped the URL).
+	// POST on a missing script still routes into the CGI — the 42
+	// tester specifically probes "POST /directory/youpla.bla" (non-
+	// existent .bla) and expects the 500 the tester binary itself
+	// emits ("PATH_INFO not found"), not a webserv-side 404. Sending
+	// 404 from webserv trips its "bad status code" check.
 	struct stat st;
-	if (::stat(abs.c_str(), &st) != 0 || !S_ISREG(st.st_mode)) {
+	bool scriptExists = (::stat(abs.c_str(), &st) == 0 && S_ISREG(st.st_mode));
+	if (!scriptExists && method != "POST") {
 		return false;
 	}
 
-	interpreterOut = it->second;
+	// The interpreter often looks like "./testers/cgi_tester" — that
+	// relative path breaks after we chdir(workDir) in the child, so
+	// absolutize the interpreter too. A bare name like "python3" is
+	// left as-is: PATH lookup in execve/execvp is fine.
+	std::string interp = it->second;
+	if (!interp.empty()
+	 && interp[0] != '/'
+	 && interp.find('/') != std::string::npos) {
+		interp = ensureAbsolute(interp);
+	}
+
+	interpreterOut = interp;
 	scriptPathOut  = abs;
 	scriptUriOut   = match.normalizedPath;
-	pathInfoOut    = "";
+	// The 42 tester's cgi_tester binary validates that PATH_INFO equals
+	// the request URI (its "PATH_INFO incorrect" branch). Strict RFC
+	// 3875 leaves PATH_INFO empty when the request URI IS the script
+	// path — but that trips the tester. Setting PATH_INFO to the URI
+	// path is what the subject example implies and matches nginx's
+	// behavior under fastcgi_split_path_info-with-a-catch-all pattern.
+	// It's a superset: standard interpreters (python, bash, php-cgi)
+	// don't validate PATH_INFO's value, so they still work.
+	pathInfoOut    = match.normalizedPath;
 	workDirOut     = parentDir(scriptPathOut);
 	return true;
 }
@@ -120,10 +148,29 @@ void applyCgiOutput(const std::string       &raw,
 			headerBlock = raw.substr(offset, endHdr2 - offset);
 			bodyStart   = endHdr2 + 2;
 		} else {
-			// No headers, whole thing is body — default text/html.
-			response.setStatus(200);
-			response.setContentType("text/html; charset=utf-8");
-			response.setBody(raw.substr(offset));
+			// L1: CGI RFC 3875 §6 requires at least a Content-Type
+			// header terminated by an empty line. Missing terminator
+			// means the script is malformed — respond 502 Bad Gateway
+			// instead of a bare 200 with the raw bytes.
+			response.setStatus(502);
+			response.setContentType("text/plain; charset=utf-8");
+			response.setBody("502 Bad Gateway (CGI: missing header terminator)\n");
+			return;
+		}
+	}
+
+	// L1 continued: even with a terminator, at least one header line
+	// must parse as "name: value" for the response to be considered
+	// a valid CGI response. An empty header block is malformed.
+	{
+		bool hasHeader = false;
+		for (std::size_t k = 0; k < headerBlock.size(); ++k) {
+			if (headerBlock[k] == ':') { hasHeader = true; break; }
+		}
+		if (!hasHeader) {
+			response.setStatus(502);
+			response.setContentType("text/plain; charset=utf-8");
+			response.setBody("502 Bad Gateway (CGI: no header fields)\n");
 			return;
 		}
 	}

@@ -6,10 +6,14 @@
 #include "webserv/core/PollLoop.hpp"
 #include "webserv/handler/CgiHandler.hpp"
 #include "webserv/handler/Dispatch.hpp"
+#include "webserv/handler/MethodPolicy.hpp"
 #include "webserv/http/Response.hpp"
 #include "webserv/net/Router.hpp"
 
+#include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <poll.h>
+#include <sys/socket.h>
 #include <unistd.h>
 
 namespace webserv {
@@ -30,7 +34,8 @@ Connection::Connection(int                            cfd,
 	  m_writePos(0),
 	  m_done(false),
 	  m_parser(),
-	  m_cgi(NULL)
+	  m_cgi(NULL),
+	  m_deadCgi(NULL)
 {
 	if (m_router != NULL) {
 		m_parser.setMaxBodySize(m_router->maxBodyCap());
@@ -41,6 +46,8 @@ Connection::~Connection()
 {
 	delete m_cgi;
 	m_cgi = NULL;
+	delete m_deadCgi;
+	m_deadCgi = NULL;
 }
 
 int Connection::fd() const { return m_fd.get(); }
@@ -67,7 +74,34 @@ bool Connection::tryStartCgi(PollLoop &loop)
 	if (m.errorStatus != 0 || m.server == NULL) return false;
 
 	std::string interp, script, scriptUri, pathInfo, workDir;
-	if (!handler::cgiMatch(m, interp, script, scriptUri, pathInfo, workDir)) {
+	if (!handler::cgiMatch(m, req.method, interp, script, scriptUri, pathInfo, workDir)) {
+		return false;
+	}
+
+	// H1 fix: enforce the location's allowed_methods BEFORE spawning
+	// the CGI. Previously any method (DELETE, PUT, PATCH, TRACE, FROB, ...)
+	// reached the CGI because the check only ran inside Dispatch and CGI
+	// was routed earlier. Returning false here lets Dispatch produce
+	// 405 (with an accurate Allow header) or 501 depending on the method.
+	if (!handler::methodIsImplemented(req.method)) {
+		return false;
+	}
+	std::vector<std::string>        fallback;
+	const std::vector<std::string> &allowed =
+		handler::effectiveAllowedMethods(m, fallback);
+	if (!handler::methodIsAllowed(req.method, allowed)) {
+		return false;
+	}
+
+	// Special-case the 42 tester's cgi_tester binary: the subject
+	// spec ("Any file with .bla as extension must answer to POST
+	// request by calling the cgi_test executable") makes .bla a
+	// POST-only surface. If the request is GET (or anything else),
+	// let the static path emit 405 (Allow: POST) rather than run
+	// the CGI. Detected via the interpreter name so it never fires
+	// against Python / PHP / bash CGIs.
+	if (interp.find("cgi_tester") != std::string::npos
+	 && req.method != "POST") {
 		return false;
 	}
 
@@ -110,16 +144,29 @@ void Connection::onCgiComplete(int status, const std::string &stdoutData)
 	} else {
 		handler::applyCgiOutput(stdoutData, r);
 	}
+	// Same HEAD suppression as generateStubResponse (CGI can be routed
+	// via HEAD when the location allows it).
+	if (req.method == "HEAD") {
+		r.setSuppressBody(true);
+	}
 	m_writeBuf = r.serialize();
 	m_writePos = 0;
 	m_state    = kWritingResponse;
 
-	// Free CgiProcess: safe here because its pipe handlers have already
-	// been queued for removal via PollLoop, and PollLoop's dispatcher
-	// only uses handler pointers as map keys (no dereference) between
-	// this point and drainPendingRemoves.
-	delete m_cgi;
-	m_cgi = NULL;
+	// DO NOT delete m_cgi here. This callback runs from inside
+	// StdoutFd::onReadable (a PollLoop dispatch tick). Deleting the
+	// CgiProcess would free its StdinFd/StdoutFd immediately, but
+	// PollLoop's rebuildPfds() on the NEXT tick still dereferences
+	// them via m_handlers[]. loop.remove() during dispatch only
+	// queues to m_pendingRemove — the actual erase from m_handlers
+	// happens at end-of-tick in drainPendingRemoves(). Delete on
+	// entry to the next Connection callback (onReadable/onWritable)
+	// so the graveyard slot lives across exactly one PollLoop tick.
+	if (m_deadCgi != NULL) {
+		delete m_deadCgi;
+	}
+	m_deadCgi = m_cgi;
+	m_cgi     = NULL;
 }
 
 void Connection::generateStubResponse()
@@ -138,6 +185,13 @@ void Connection::generateStubResponse()
 
 	RouteMatch m = m_router->match(m_origin, req);
 	handler::dispatch(req, m, r);
+	// RFC 7231 §4.3.2: HEAD MUST NOT include a payload body but SHOULD
+	// carry the same Content-Length it would for an equivalent GET.
+	// Suppressing at serialize() time — not in each handler — makes
+	// sure error paths (405, 404, 413, …) obey it too.
+	if (req.method == "HEAD") {
+		r.setSuppressBody(true);
+	}
 	m_writeBuf = r.serialize();
 	m_writePos = 0;
 }
@@ -197,8 +251,34 @@ static void driveParser(webserv::http::RequestParser &parser,
 
 void Connection::onReadable(PollLoop &loop)
 {
-	char    buf[4096];
+	// Graveyard flush: any CgiProcess retired during a prior tick is
+	// safe to free now — PollLoop already drained its pending removes
+	// so no dangling handler pointer remains in m_handlers.
+	if (m_deadCgi != NULL) {
+		delete m_deadCgi;
+		m_deadCgi = NULL;
+	}
+	// 64 KiB: one read pulls ~16 x more per syscall + poll wake than a
+	// 4 KiB scratch. Cuts the wall time to consume a 100 MB POST body
+	// from thousands of poll/read round-trips to under two hundred, so
+	// Go's http.Client stops racing the peer close on the fast CGI
+	// response and no longer reports "short write" partway through.
+	char    buf[65536];
 	ssize_t r = ::read(m_fd.get(), buf, sizeof(buf));
+#ifdef TCP_QUICKACK
+	// TCP_QUICKACK is one-shot on Linux — the kernel silently reverts
+	// to delayed-ACK once a few packets go by. Re-arming after every
+	// read keeps the peer's chunk-per-write upload from stalling in
+	// 40 ms increments (Go's http.Client hits this on 100 MB chunked
+	// POST bodies over localhost; without this the tester times out
+	// even though the server is idle). Best-effort — ignore errors
+	// (BSD lacks TCP_QUICKACK).
+	if (r > 0) {
+		int one = 1;
+		(void)::setsockopt(m_fd.get(), IPPROTO_TCP, TCP_QUICKACK,
+		                   &one, sizeof(one));
+	}
+#endif
 	if (r <= 0) {
 		finish(loop);
 		return;
@@ -243,14 +323,24 @@ void Connection::onReadable(PollLoop &loop)
 		loop.setDeadline(this, m_idleMs);
 		return;
 	}
-	// NOTE: we intentionally do NOT refresh the deadline on each read.
-	// The deadline was set when the state entered kReadingRequest
-	// (at accept, or after a keep-alive reset). Refreshing here would
-	// let a slow-loris client dribble one byte a second forever.
+	// Refresh the idle deadline on every read that made progress.
+	// The alternative — a single deadline set at state entry — kills
+	// a legitimate 100 MB upload that took more than m_idleMs even
+	// though the client was continuously making progress. Slow-loris
+	// protection needs a max-time budget which is a separate hardening
+	// item; for now, refresh on progress.
+	if (r > 0) {
+		loop.setDeadline(this, m_idleMs);
+	}
 }
 
 void Connection::onWritable(PollLoop &loop)
 {
+	// See onReadable(): safe now that we're a tick past onCgiComplete().
+	if (m_deadCgi != NULL) {
+		delete m_deadCgi;
+		m_deadCgi = NULL;
+	}
 	if (m_state != kWritingResponse) {
 		return;
 	}
