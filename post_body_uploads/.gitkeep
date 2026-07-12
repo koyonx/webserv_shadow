@@ -1,0 +1,5 @@
+# examples/tester.conf's `location /post_body { upload_store post_body_uploads; }`
+# needs this directory to exist at runtime (the server does not auto-mkdir).
+# Uploaded artifacts inside it are ephemeral and ignored per .gitignore's
+# `post_body_uploads/` line — this file is the sole tracked entry that
+# keeps the directory itself in the repo.
