@@ -35,7 +35,11 @@ Connection::Connection(int                            cfd,
 	  m_done(false),
 	  m_parser(),
 	  m_cgi(NULL),
-	  m_deadCgi(NULL)
+	  m_deadCgi(NULL),
+	  m_cgiHeaderBlock(),
+	  m_cgiBodyBuf(),
+	  m_cgiHeadersSeen(false),
+	  m_cgiStreaming(false)
 {
 	if (m_router != NULL) {
 		m_parser.setMaxBodySize(m_router->maxBodyCap());
@@ -55,10 +59,16 @@ int Connection::fd() const { return m_fd.get(); }
 short Connection::wantEvents() const
 {
 	switch (m_state) {
-		case kReadingRequest:  return POLLIN;
-		case kRunningCgi:      return 0;      // pipes drive progress
-		case kWritingResponse: return POLLOUT;
-		case kClosing:         return 0;
+		case kReadingRequest:      return POLLIN;
+		case kRunningCgi:          return 0;      // pipes drive progress
+		case kStreamingCgiToClient:
+			// Drain to the socket only when there's something queued.
+			// The CGI stdout handler is the one appending frames; if
+			// m_writeBuf is empty we're waiting on the CGI, not the
+			// client.
+			return (m_writePos < m_writeBuf.size()) ? POLLOUT : 0;
+		case kWritingResponse:     return POLLOUT;
+		case kClosing:             return 0;
 	}
 	return 0;
 }
@@ -127,31 +137,131 @@ bool Connection::tryStartCgi(PollLoop &loop)
 	return true;
 }
 
-void Connection::onCgiComplete(int status, const std::string &stdoutData)
+// -------- Streaming CGI callback surface (S5).
+//
+// onCgiHeaders decides whether this response can stream:
+//   - HEAD               -> buffered (need Content-Length to match GET).
+//   - empty headerBlock  -> buffered 502 (CGI produced malformed output).
+//   - parseCgiHeaders 502 (missing name:value) -> buffered 502.
+//   - otherwise          -> chunked streaming: build the header block
+//                           with Transfer-Encoding: chunked, queue it,
+//                           and future onCgiBodyChunk calls append
+//                           chunk frames directly to m_writeBuf.
+//
+// onCgiBodyChunk either appends a chunk frame (streaming path) or
+// accumulates into m_cgiBodyBuf (buffered path). onCgiEnd finishes
+// the message: streaming path appends the 0-CRLFCRLF terminator and
+// flips to kWritingResponse; buffered path assembles the final
+// Response with body and Content-Length as before.
+
+void Connection::onCgiHeaders(const std::string &headerBlock)
 {
+	m_cgiHeaderBlock = headerBlock;
+	m_cgiHeadersSeen = true;
+
 	const webserv::http::Request &req = m_parser.request();
+
+	// Buffered path selection: HEAD or malformed / empty header block.
+	if (req.method == "HEAD" || headerBlock.empty()) {
+		m_cgiStreaming = false;
+		return;
+	}
+
+	// Streaming path: parse the header block through parseCgiHeaders
+	// so Status:, Location:, Set-Cookie and every other header is
+	// applied uniformly with the buffered path. If parse says 502
+	// (no name:value pair), fall back to buffered so onCgiEnd can
+	// emit the standard 502 body.
 	webserv::http::Response r;
 	r.setKeepAlive(req.keepAlive);
+	int rc = handler::parseCgiHeaders(headerBlock, r);
+	if (rc != 0) {
+		m_cgiStreaming = false;
+		return;
+	}
 
-	if (status < 0) {
-		r.setStatus(504);
-		r.setContentType("text/plain; charset=utf-8");
-		r.setBody("504 Gateway Timeout\n");
-	} else if (status != 0 && stdoutData.empty()) {
-		r.setStatus(502);
-		r.setContentType("text/plain; charset=utf-8");
-		r.setBody("502 Bad Gateway\n");
+	r.setChunked(true);
+	std::string hdrs = r.serializeHeaders();
+	// Append rather than assign — m_writeBuf may not be empty on a
+	// keep-alive connection reused mid-tick (in practice it is, but
+	// defensive).
+	m_writeBuf.append(hdrs);
+	m_cgiStreaming = true;
+	m_state        = kStreamingCgiToClient;
+}
+
+void Connection::onCgiBodyChunk(const char *data, std::size_t len)
+{
+	if (len == 0) return;
+
+	if (m_cgiStreaming) {
+		// Chunk-frame directly to the write buffer. The socket
+		// writer (onWritable) drains it in parallel; no whole-body
+		// std::string is ever built.
+		std::string frame = webserv::http::Response::chunkFrame(data, len);
+		m_writeBuf.append(frame);
+		return;
+	}
+	// Buffered fallback (HEAD or malformed headers): accumulate for
+	// the final assemble in onCgiEnd.
+	m_cgiBodyBuf.append(data, len);
+}
+
+void Connection::onCgiEnd(int exitStatus)
+{
+	const webserv::http::Request &req = m_parser.request();
+
+	if (m_cgiStreaming) {
+		// Streaming path: we already sent the status line + headers
+		// to the client. If the CGI ended cleanly we can close the
+		// message with the 0-length chunk terminator. If it died mid-
+		// stream we can't inject a 5xx (the status line is on the
+		// wire) — best we can do is skip the terminator and finish()
+		// on the next writable so the peer sees a truncated response.
+		if (exitStatus < 0) {
+			LOG_WARN("cgi: streaming aborted (status=" << exitStatus
+			         << ") — closing connection without terminator");
+			// Force the connection to close after m_writeBuf drains.
+			// The parser::keepAlive flag is what onWritable's final
+			// keep-alive check reads; the response header we already
+			// sent said keep-alive, but truncation is unavoidable.
+		} else {
+			m_writeBuf.append(webserv::http::Response::chunkTerminator());
+		}
+		m_state = kWritingResponse;
 	} else {
-		handler::applyCgiOutput(stdoutData, r);
+		// Buffered path (HEAD or malformed): assemble the final
+		// response once, same as the S1 shape.
+		webserv::http::Response r;
+		r.setKeepAlive(req.keepAlive);
+
+		if (exitStatus < 0) {
+			r.setStatus(504);
+			r.setContentType("text/plain; charset=utf-8");
+			r.setBody("504 Gateway Timeout\n");
+		} else if (!m_cgiHeadersSeen || m_cgiHeaderBlock.empty()) {
+			r.setStatus(502);
+			r.setContentType("text/plain; charset=utf-8");
+			r.setBody("502 Bad Gateway\n");
+		} else {
+			// Recombine + reuse applyCgiOutput. This branch is HEAD
+			// (or a parseCgiHeaders 502 that we mapped to buffered);
+			// either way body may be present and we need
+			// Content-Length to reflect it.
+			std::string raw;
+			raw.reserve(m_cgiHeaderBlock.size() + 4 + m_cgiBodyBuf.size());
+			raw.append(m_cgiHeaderBlock);
+			raw.append("\r\n\r\n", 4);
+			raw.append(m_cgiBodyBuf);
+			handler::applyCgiOutput(raw, r);
+		}
+		if (req.method == "HEAD") {
+			r.setSuppressBody(true);
+		}
+		m_writeBuf = r.serialize();
+		m_writePos = 0;
+		m_state    = kWritingResponse;
 	}
-	// Same HEAD suppression as generateStubResponse (CGI can be routed
-	// via HEAD when the location allows it).
-	if (req.method == "HEAD") {
-		r.setSuppressBody(true);
-	}
-	m_writeBuf = r.serialize();
-	m_writePos = 0;
-	m_state    = kWritingResponse;
 
 	// DO NOT delete m_cgi here. This callback runs from inside
 	// StdoutFd::onReadable (a PollLoop dispatch tick). Deleting the
@@ -341,7 +451,8 @@ void Connection::onWritable(PollLoop &loop)
 		delete m_deadCgi;
 		m_deadCgi = NULL;
 	}
-	if (m_state != kWritingResponse) {
+	if (m_state != kWritingResponse
+	 && m_state != kStreamingCgiToClient) {
 		return;
 	}
 	std::size_t remaining = m_writeBuf.size() - m_writePos;
@@ -355,6 +466,19 @@ void Connection::onWritable(PollLoop &loop)
 		}
 		m_writePos += static_cast<std::size_t>(w);
 	}
+
+	// Streaming: if the CGI is still producing, don't try to close
+	// the connection. Compact the buffer (freeing the bytes already
+	// on the wire) and wait for onCgiBodyChunk / onCgiEnd to
+	// refill / terminate it.
+	if (m_state == kStreamingCgiToClient) {
+		if (m_writePos == m_writeBuf.size()) {
+			m_writeBuf.clear();
+			m_writePos = 0;
+		}
+		return;
+	}
+
 	if (m_writePos < m_writeBuf.size()) {
 		// Same reasoning as onReadable: the deadline set at state
 		// entry (kWritingResponse) covers the whole response write;
@@ -378,6 +502,12 @@ void Connection::onWritable(PollLoop &loop)
 	m_writeBuf.clear();
 	m_writePos = 0;
 	m_state    = kReadingRequest;
+	// CGI scratch belongs to the just-finished request. Clear it so
+	// the next request over the same connection starts fresh.
+	m_cgiHeaderBlock.clear();
+	m_cgiBodyBuf.clear();
+	m_cgiHeadersSeen = false;
+	m_cgiStreaming   = false;
 
 	if (!m_readBuf.empty()) {
 		bool parseError = false, complete = false;

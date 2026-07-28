@@ -138,7 +138,9 @@ RequestParser::RequestParser()
 	  m_seenContentLength(false),
 	  m_seenTransferEncoding(false),
 	  m_status(0),
-	  m_errmsg(NULL)
+	  m_errmsg(NULL),
+	  m_bodySink(NULL),
+	  m_bodyEndFired(false)
 {}
 
 void RequestParser::reset()
@@ -155,6 +157,8 @@ void RequestParser::reset()
 	m_seenTransferEncoding  = false;
 	m_status = 0;
 	m_errmsg = NULL;
+	m_bodySink     = NULL;
+	m_bodyEndFired = false;
 }
 
 const Request &RequestParser::request()      const { return m_req; }
@@ -164,6 +168,15 @@ void           RequestParser::setMaxRequestLine(std::size_t b) { m_maxLine = b; 
 void           RequestParser::setMaxHeaderBytes(std::size_t b) { m_maxHeaderBytes = b; }
 void           RequestParser::setMaxHeaderCount(std::size_t n) { m_maxHeaderCount = n; }
 void           RequestParser::setMaxBodySize(std::size_t b)    { m_maxBody = b; }
+void           RequestParser::setBodySink(IBodyChunkSink *s)   { m_bodySink = s; }
+bool           RequestParser::headersReady()             const
+{
+	// Any body phase — CL, chunked, trailer — or kPhaseDone means
+	// the request-line + all header fields have been fully consumed.
+	// kPhaseError is intentionally excluded (caller can still tell
+	// from errorStatus()).
+	return m_phase >= kPhaseBodyCL && m_phase <= kPhaseDone;
+}
 
 void RequestParser::setError(int status, const char *msg)
 {
@@ -561,10 +574,22 @@ bool RequestParser::finalizeHeaders()
 			setError(413, "declared Content-Length exceeds max body size");
 			return false;
 		}
-		m_req.body.reserve(m_req.contentLength);
+		// Only pre-reserve when we're going to store the body ourselves.
+		// A streaming sink absorbs each chunk directly so req.body would
+		// stay empty; reserving a fresh 100 MB just to hold nothing is
+		// exactly the peak-memory pathology streaming exists to avoid.
+		if (m_bodySink == NULL) {
+			m_req.body.reserve(m_req.contentLength);
+		}
 		m_phase = kPhaseBodyCL;
 	} else {
 		m_phase = kPhaseDone;
+		// No body → fire onBodyEnd immediately so the sink can close
+		// its stdin (relevant for POST with Content-Length: 0).
+		if (m_bodySink != NULL && !m_bodyEndFired) {
+			m_bodyEndFired = true;
+			m_bodySink->onBodyEnd();
+		}
 	}
 	return true;
 }
@@ -612,11 +637,20 @@ ParseResult RequestParser::feedBody(const char *data,
 			std::size_t need  = m_req.contentLength - m_bodyBytesRead;
 			std::size_t avail = len - consumed;
 			std::size_t take  = (need < avail) ? need : avail;
-			m_req.body.append(data + consumed, take);
+			if (m_bodySink != NULL) {
+				// Streaming: forward the chunk instead of growing req.body.
+				m_bodySink->onBodyChunk(data + consumed, take);
+			} else {
+				m_req.body.append(data + consumed, take);
+			}
 			m_bodyBytesRead += take;
 			consumed        += take;
 			if (m_bodyBytesRead == m_req.contentLength) {
 				m_phase = kPhaseDone;
+				if (m_bodySink != NULL && !m_bodyEndFired) {
+					m_bodyEndFired = true;
+					m_bodySink->onBodyEnd();
+				}
 				return kParseComplete;
 			}
 			return kParseNeedMore;
@@ -646,7 +680,11 @@ ParseResult RequestParser::feedBody(const char *data,
 		if (m_phase == kPhaseBodyChunkData) {
 			std::size_t avail = len - consumed;
 			std::size_t take  = (m_chunkRemaining < avail) ? m_chunkRemaining : avail;
-			m_req.body.append(data + consumed, take);
+			if (m_bodySink != NULL) {
+				m_bodySink->onBodyChunk(data + consumed, take);
+			} else {
+				m_req.body.append(data + consumed, take);
+			}
 			m_bodyBytesRead  += take;
 			m_chunkRemaining -= take;
 			consumed         += take;
@@ -684,6 +722,10 @@ ParseResult RequestParser::feedBody(const char *data,
 				}
 				if (m_line.empty()) {
 					m_phase = kPhaseDone;
+					if (m_bodySink != NULL && !m_bodyEndFired) {
+						m_bodyEndFired = true;
+						m_bodySink->onBodyEnd();
+					}
 					return kParseComplete;
 				}
 				// Trailer field-line: discarded (not merged into headers).

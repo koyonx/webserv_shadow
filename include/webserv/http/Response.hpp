@@ -49,10 +49,45 @@ public:
 	// bytes onto a keep-alive connection and desyncs the next response.
 	Response &setSuppressBody(bool suppress);
 
+	// Chunked streaming mode.
+	//
+	// Turning this on emits `Transfer-Encoding: chunked` instead of
+	// `Content-Length: N` in serializeHeaders(), so a caller that
+	// doesn't know the body size up-front (a CGI script's stdout is
+	// the canonical case) can stream body chunks to the wire without
+	// buffering. In this mode:
+	//   - serializeHeaders() returns just the status line + headers
+	//     + the empty-line separator; m_body is not written.
+	//   - Body bytes must be encoded via chunkFrame() before being
+	//     handed to the socket (one frame per stdout read is fine).
+	//   - The stream MUST be terminated by chunkTerminator() — a
+	//     "0\r\n\r\n" — otherwise the peer waits forever.
+	Response &setChunked(bool on);
+
 	int    status()    const;
 	bool   keepAlive() const;
+	bool   chunked()   const;
 
 	std::string serialize() const;
+
+	// Header-only serialization for streaming responses. Emits the
+	// status line, user + default headers (Content-Length is
+	// suppressed when chunked mode is on), and the terminating blank
+	// line. m_body is NOT appended — the caller feeds body bytes
+	// separately via chunkFrame() / chunkTerminator().
+	std::string serializeHeaders() const;
+
+	// Frame `data`/`len` bytes as one HTTP/1.1 Transfer-Encoding
+	// chunk: "<hexlen>\r\n<bytes>\r\n". Empty chunks are a no-op
+	// (the terminator is a *separate* helper so this method can be
+	// called safely inside a loop without accidentally closing the
+	// stream on a zero-byte read).
+	static std::string chunkFrame(const char *data, std::size_t len);
+
+	// The zero-length chunk that ends a chunked response body:
+	// "0\r\n\r\n". Must be sent exactly once after the last
+	// chunkFrame() call.
+	static std::string chunkTerminator();
 
 	// Convenience: build a plain-text error response with the standard
 	// reason phrase and a short body "STATUS reason".
@@ -70,6 +105,7 @@ private:
 	std::string m_body;
 	bool        m_keepAlive;
 	bool        m_suppressBody;
+	bool        m_chunked;
 };
 
 const char *reasonPhrase(int status);
