@@ -173,7 +173,13 @@ void applyCgiOutput(const std::string       &raw,
 	response.setStatus(status);
 	if (!statusReason.empty()) response.setReason(statusReason);
 	for (std::size_t i = 0; i < userHeaders.size(); ++i) {
-		response.setHeader(userHeaders[i].first, userHeaders[i].second);
+		// Set-Cookie can legitimately repeat; every other header we
+		// let CGI override anything already set on the response.
+		if (strutil::iequals(userHeaders[i].first, "Set-Cookie")) {
+			response.addHeader(userHeaders[i].first, userHeaders[i].second);
+		} else {
+			response.setHeader(userHeaders[i].first, userHeaders[i].second);
+		}
 	}
 	response.setBody(raw.substr(bodyStart));
 }
