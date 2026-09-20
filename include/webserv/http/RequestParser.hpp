@@ -15,6 +15,23 @@ enum ParseResult {
 	kParseError    = 2
 };
 
+// Sink for streaming body bytes as the parser consumes them, so a
+// consumer (e.g. CgiProcess) can start processing before the whole
+// body has arrived. When a sink is set, the parser does NOT grow
+// req.body — it forwards every chunk to onBodyChunk() and calls
+// onBodyEnd() once the last byte of the declared / chunked body has
+// been consumed. Body-size cap enforcement still runs on the raw
+// byte count (413 fires the same way).
+//
+// Callbacks are invoked inline from feed(), so any allocations they
+// do count against the same tick's dispatch budget. Must not throw.
+class IBodyChunkSink {
+public:
+	virtual ~IBodyChunkSink() {}
+	virtual void onBodyChunk(const char *data, std::size_t len) = 0;
+	virtual void onBodyEnd()                                    = 0;
+};
+
 // Streaming HTTP/1.x request parser.
 //
 //   feed(data, len, consumed) -> kParseNeedMore | kParseComplete | kParseError
@@ -40,6 +57,19 @@ public:
 	void setMaxHeaderBytes(std::size_t bytes);
 	void setMaxHeaderCount(std::size_t n);
 	void setMaxBodySize(std::size_t bytes);
+
+	// Attach / detach a streaming body sink. Passing NULL restores the
+	// legacy "grow req.body in place" behaviour. Sinks may be set at
+	// any point BEFORE the body starts (i.e. before feed() returns
+	// from the header phase); attaching mid-body will silently miss
+	// the bytes already parsed into req.body.
+	void setBodySink(IBodyChunkSink *sink);
+
+	// True once the request-line + headers have been fully consumed
+	// (parser is in a body phase or already done). Connection uses
+	// this to spawn a CGI early and hook up the body sink before the
+	// upload arrives.
+	bool headersReady() const;
 
 private:
 	RequestParser(const RequestParser &);
@@ -99,6 +129,9 @@ private:
 
 	int         m_status;
 	const char *m_errmsg;
+
+	IBodyChunkSink *m_bodySink;
+	bool            m_bodyEndFired;
 };
 
 } // namespace http

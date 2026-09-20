@@ -122,65 +122,42 @@ bool cgiMatch(const webserv::RouteMatch &match,
 	return true;
 }
 
-void applyCgiOutput(const std::string       &raw,
+int parseCgiHeaders(const std::string       &headerBlock,
                     webserv::http::Response &response)
 {
-	// NPH: "HTTP/1.1 STATUS ..." — passthrough of everything wholesale
-	// is complex because our Response builder always emits Date/Server;
-	// safer approach: strip the leading status-line, treat the rest as
-	// normal CGI. Real "raw passthrough" NPH is a hardening branch item.
+	// L1: an empty header block (no bytes before the terminator, or
+	// no ':' at all in it) means the CGI didn't produce a well-formed
+	// response. Signal 502 to the caller without touching response.
+	if (headerBlock.empty()) {
+		return 502;
+	}
+
+	// NPH prefix: "HTTP/1.1 STATUS reason\r\n" is legal per RFC 3875
+	// §6.2.4. We don't do full passthrough (our Response builder still
+	// wants to inject Date/Server); just strip the status-line and
+	// treat the rest as CGI headers.
 	std::size_t offset = 0;
-	if (raw.compare(0, 5, "HTTP/") == 0) {
-		std::size_t nl = raw.find('\n');
+	if (headerBlock.compare(0, 5, "HTTP/") == 0) {
+		std::size_t nl = headerBlock.find('\n');
 		if (nl != std::string::npos) offset = nl + 1;
 	}
 
-	// Locate CRLF CRLF or LF LF as end-of-headers.
-	std::string::size_type endHdr = raw.find("\r\n\r\n", offset);
-	std::size_t bodyStart;
-	std::string headerBlock;
-	if (endHdr != std::string::npos) {
-		headerBlock = raw.substr(offset, endHdr - offset);
-		bodyStart   = endHdr + 4;
-	} else {
-		std::string::size_type endHdr2 = raw.find("\n\n", offset);
-		if (endHdr2 != std::string::npos) {
-			headerBlock = raw.substr(offset, endHdr2 - offset);
-			bodyStart   = endHdr2 + 2;
-		} else {
-			// L1: CGI RFC 3875 §6 requires at least a Content-Type
-			// header terminated by an empty line. Missing terminator
-			// means the script is malformed — respond 502 Bad Gateway
-			// instead of a bare 200 with the raw bytes.
-			response.setStatus(502);
-			response.setContentType("text/plain; charset=utf-8");
-			response.setBody("502 Bad Gateway (CGI: missing header terminator)\n");
-			return;
-		}
-	}
-
-	// L1 continued: even with a terminator, at least one header line
-	// must parse as "name: value" for the response to be considered
-	// a valid CGI response. An empty header block is malformed.
+	// L1 continued: at least one 'name: value' pair is required.
 	{
 		bool hasHeader = false;
-		for (std::size_t k = 0; k < headerBlock.size(); ++k) {
+		for (std::size_t k = offset; k < headerBlock.size(); ++k) {
 			if (headerBlock[k] == ':') { hasHeader = true; break; }
 		}
 		if (!hasHeader) {
-			response.setStatus(502);
-			response.setContentType("text/plain; charset=utf-8");
-			response.setBody("502 Bad Gateway (CGI: no header fields)\n");
-			return;
+			return 502;
 		}
 	}
 
-	// Parse header lines.
 	int         status = 200;
 	std::string statusReason;
 	std::vector<std::pair<std::string, std::string> > userHeaders;
 
-	std::size_t p = 0;
+	std::size_t p = offset;
 	while (p < headerBlock.size()) {
 		std::string::size_type nl = headerBlock.find('\n', p);
 		std::string line = (nl == std::string::npos)
@@ -227,6 +204,42 @@ void applyCgiOutput(const std::string       &raw,
 		} else {
 			response.setHeader(userHeaders[i].first, userHeaders[i].second);
 		}
+	}
+	return 0;
+}
+
+void applyCgiOutput(const std::string       &raw,
+                    webserv::http::Response &response)
+{
+	// Locate CRLF CRLF or LF LF as end-of-headers, without stripping
+	// any NPH prefix here — parseCgiHeaders handles that.
+	std::string::size_type endHdr = raw.find("\r\n\r\n");
+	std::size_t bodyStart;
+	std::string headerBlock;
+	if (endHdr != std::string::npos) {
+		headerBlock = raw.substr(0, endHdr);
+		bodyStart   = endHdr + 4;
+	} else {
+		std::string::size_type endHdr2 = raw.find("\n\n");
+		if (endHdr2 != std::string::npos) {
+			headerBlock = raw.substr(0, endHdr2);
+			bodyStart   = endHdr2 + 2;
+		} else {
+			// L1: no terminator at all.
+			response.setStatus(502);
+			response.setContentType("text/plain; charset=utf-8");
+			response.setBody("502 Bad Gateway (CGI: missing header terminator)\n");
+			return;
+		}
+	}
+
+	int rc = parseCgiHeaders(headerBlock, response);
+	if (rc != 0) {
+		// L1: empty header block or no name:value pair.
+		response.setStatus(502);
+		response.setContentType("text/plain; charset=utf-8");
+		response.setBody("502 Bad Gateway (CGI: no header fields)\n");
+		return;
 	}
 	response.setBody(raw.substr(bodyStart));
 }

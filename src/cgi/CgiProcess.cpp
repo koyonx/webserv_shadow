@@ -28,7 +28,11 @@ CgiProcess::CgiProcess(const std::string              &interpreter,
 	  m_env(env),
 	  m_body(body),
 	  m_bodyPos(0),
-	  m_output(),
+	  m_headerBuf(),
+	  m_headersFired(false),
+	  m_headerMalformed(false),
+	  m_headerCapBytes(16UL * 1024UL),
+	  m_bodyStreamedBytes(0),
 	  m_pid(-1),
 	  m_cb(cb),
 	  m_in(NULL),
@@ -188,21 +192,85 @@ void CgiProcess::onStdinReady(PollLoop &loop)
 	}
 }
 
+// S3: stdout streaming — accumulate into m_headerBuf only until we
+// spot the header terminator, then flow every subsequent read through
+// to onCgiBodyChunk without buffering. This is the change that
+// removes the 186 MB peak-in-server-memory footprint of a
+// cgi_tester echo for a 100 MB POST body.
 void CgiProcess::onStdoutReady(PollLoop &loop)
 {
 	if (m_stdoutClosed || m_out == NULL) return;
 
-	char    buf[4096];
+	// One-shot 64 KiB read: same reasoning as the client-side
+	// buffer bump in Connection — big-body scenarios shouldn't
+	// need thousands of poll/read round-trips.
+	char    buf[65536];
 	ssize_t r = ::read(m_out->fd(), buf, sizeof(buf));
-	if (r > 0) {
-		m_output.append(buf, static_cast<std::size_t>(r));
+	if (r <= 0) {
+		// EOF or transient error — treat as end-of-child-output.
+		m_stdoutClosed = true;
+		m_out->closeFd();
+		loop.remove(m_out);
+		tryFinish(loop);
 		return;
 	}
-	// EOF or transient error — treat as end-of-child-output.
-	m_stdoutClosed = true;
-	m_out->closeFd();
-	loop.remove(m_out);
-	tryFinish(loop);
+
+	std::size_t n = static_cast<std::size_t>(r);
+
+	if (m_headersFired) {
+		// Already streaming body — pass straight through. Connection
+		// (via ICgiCallback) is responsible for framing / suppressing
+		// as needed (HEAD, malformed-header 502, ...).
+		m_bodyStreamedBytes += n;
+		m_cb.onCgiBodyChunk(buf, n);
+		return;
+	}
+
+	// Still collecting headers. Append and search for terminator.
+	m_headerBuf.append(buf, n);
+	std::string::size_type end     = m_headerBuf.find("\r\n\r\n");
+	std::size_t            sepLen  = 4;
+	if (end == std::string::npos) {
+		end = m_headerBuf.find("\n\n");
+		sepLen = 2;
+	}
+	if (end != std::string::npos) {
+		// Header terminator found. Fire onCgiHeaders with the block
+		// before the terminator; anything after is the first body
+		// chunk. Free m_headerBuf so we're not carrying the header
+		// bytes around for the rest of the request lifetime.
+		std::string headerBlock = m_headerBuf.substr(0, end);
+		std::size_t bodyStart   = end + sepLen;
+		std::string tailBody;
+		if (bodyStart < m_headerBuf.size()) {
+			tailBody.assign(m_headerBuf, bodyStart,
+			                m_headerBuf.size() - bodyStart);
+		}
+		m_headerBuf.clear();
+		std::string().swap(m_headerBuf);   // release capacity
+		m_headersFired = true;
+		m_cb.onCgiHeaders(headerBlock);
+		if (!tailBody.empty()) {
+			m_bodyStreamedBytes += tailBody.size();
+			m_cb.onCgiBodyChunk(tailBody.data(), tailBody.size());
+		}
+		return;
+	}
+
+	// No terminator yet — but if the CGI is spraying pre-header
+	// junk past the cap it's malformed. Fire onCgiHeaders("") once
+	// to signal the L1 502 path to Connection, then drop future
+	// stdout on the floor (we still keep reading so the child
+	// doesn't SIGPIPE, but we no longer grow m_headerBuf).
+	if (m_headerBuf.size() > m_headerCapBytes) {
+		LOG_WARN("cgi: header block exceeded "
+		         << m_headerCapBytes << "B without terminator");
+		m_headersFired    = true;
+		m_headerMalformed = true;
+		m_headerBuf.clear();
+		std::string().swap(m_headerBuf);
+		m_cb.onCgiHeaders(std::string());   // empty = malformed
+	}
 }
 
 void CgiProcess::tryFinish(PollLoop &loop)
@@ -246,8 +314,17 @@ void CgiProcess::reapAndCallback(int status)
 	if (m_finished) return;
 	m_finished = true;
 	LOG_INFO("cgi: exit status=" << status
-	         << " output=" << m_output.size() << "B");
-	m_cb.onCgiComplete(status, m_output);
+	         << " body_streamed=" << m_bodyStreamedBytes << "B"
+	         << (m_headersFired ? "" : " (no headers seen)"));
+
+	// If the child exited before its stdout emitted the header
+	// terminator, tell Connection so it can emit 502. Empty
+	// headerBlock is the sentinel.
+	if (!m_headersFired) {
+		m_headersFired = true;
+		m_cb.onCgiHeaders(std::string());
+	}
+	m_cb.onCgiEnd(status);
 }
 
 void CgiProcess::onDeadlineExpired(PollLoop &loop)

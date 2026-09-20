@@ -67,7 +67,8 @@ Response::Response()
 	  m_headers(),
 	  m_body(),
 	  m_keepAlive(false),
-	  m_suppressBody(false)
+	  m_suppressBody(false),
+	  m_chunked(false)
 {}
 
 void Response::clear()
@@ -79,6 +80,7 @@ void Response::clear()
 	m_body.clear();
 	m_keepAlive = false;
 	m_suppressBody = false;
+	m_chunked = false;
 }
 
 Response &Response::setVersion(const Version &v) { m_version   = v; return *this; }
@@ -128,8 +130,15 @@ Response &Response::setSuppressBody(bool suppress)
 	return *this;
 }
 
+Response &Response::setChunked(bool on)
+{
+	m_chunked = on;
+	return *this;
+}
+
 int  Response::status()    const { return m_status; }
 bool Response::keepAlive() const { return m_keepAlive; }
+bool Response::chunked()   const { return m_chunked; }
 
 bool Response::hasHeader(const std::string &name) const
 {
@@ -142,7 +151,7 @@ bool Response::hasHeader(const std::string &name) const
 	return false;
 }
 
-std::string Response::serialize() const
+std::string Response::serializeHeaders() const
 {
 	std::ostringstream oss;
 
@@ -172,7 +181,15 @@ std::string Response::serialize() const
 	if (!hasHeader("Content-Type") && !m_body.empty()) {
 		oss << "Content-Type: text/plain; charset=utf-8\r\n";
 	}
-	if (!hasHeader("Content-Length")) {
+	// Framing: chunked wins over Content-Length. If both were somehow
+	// user-set (nonsensical but possible via addHeader), the chunked
+	// branch is authoritative because we're about to feed the wire
+	// with chunk-framed body bytes.
+	if (m_chunked) {
+		if (!hasHeader("Transfer-Encoding")) {
+			oss << "Transfer-Encoding: chunked\r\n";
+		}
+	} else if (!hasHeader("Content-Length")) {
 		oss << "Content-Length: " << m_body.size() << "\r\n";
 	}
 	if (!hasHeader("Connection")) {
@@ -180,13 +197,52 @@ std::string Response::serialize() const
 	}
 
 	oss << "\r\n";
-	// HEAD (or any 1xx/204/304): headers only. Content-Length above
-	// still advertises the body size the equivalent GET would have
-	// returned, per RFC 7231 §4.3.2.
-	if (!m_suppressBody) {
-		oss << m_body;
-	}
 	return oss.str();
+}
+
+std::string Response::serialize() const
+{
+	std::string out = serializeHeaders();
+	// Buffered mode: append the in-memory body (unless suppressed for
+	// HEAD / 1xx / 204 / 304). Streaming callers should use
+	// serializeHeaders() + chunkFrame() / chunkTerminator() instead
+	// so a 100 MB CGI body never sits in this string.
+	if (m_chunked) {
+		if (!m_body.empty() && !m_suppressBody) {
+			out += chunkFrame(m_body.data(), m_body.size());
+		}
+		out += chunkTerminator();
+	} else if (!m_suppressBody) {
+		out += m_body;
+	}
+	return out;
+}
+
+std::string Response::chunkFrame(const char *data, std::size_t len)
+{
+	if (len == 0) {
+		// Deliberately a no-op, not the terminator: an implementation
+		// might read 0 bytes without EOF (spurious wake-up) and we
+		// don't want to close the stream on it.
+		return std::string();
+	}
+	// Hex length (lowercase) + CRLF + payload + CRLF.
+	std::ostringstream hex;
+	hex.setf(std::ios::hex, std::ios::basefield);
+	hex << len;
+	std::string frame;
+	frame.reserve(hex.str().size() + 2 + len + 2);
+	frame.append(hex.str());
+	frame.append("\r\n", 2);
+	frame.append(data, len);
+	frame.append("\r\n", 2);
+	return frame;
+}
+
+std::string Response::chunkTerminator()
+{
+	// Zero-length chunk. No trailers, so an empty line ends the message.
+	return std::string("0\r\n\r\n", 5);
 }
 
 Response Response::makeError(int status)
