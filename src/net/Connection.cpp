@@ -1,7 +1,10 @@
 #include "webserv/net/Connection.hpp"
 
+#include "webserv/Error.hpp"
 #include "webserv/Log.hpp"
+#include "webserv/cgi/CgiEnv.hpp"
 #include "webserv/core/PollLoop.hpp"
+#include "webserv/handler/CgiHandler.hpp"
 #include "webserv/handler/Dispatch.hpp"
 #include "webserv/http/Response.hpp"
 #include "webserv/net/Router.hpp"
@@ -26,10 +29,19 @@ Connection::Connection(int                            cfd,
 	  m_writeBuf(),
 	  m_writePos(0),
 	  m_done(false),
-	  m_parser()
-{}
+	  m_parser(),
+	  m_cgi(NULL)
+{
+	if (m_router != NULL) {
+		m_parser.setMaxBodySize(m_router->maxBodyCap());
+	}
+}
 
-Connection::~Connection() {}
+Connection::~Connection()
+{
+	delete m_cgi;
+	m_cgi = NULL;
+}
 
 int Connection::fd() const { return m_fd.get(); }
 
@@ -37,6 +49,7 @@ short Connection::wantEvents() const
 {
 	switch (m_state) {
 		case kReadingRequest:  return POLLIN;
+		case kRunningCgi:      return 0;      // pipes drive progress
 		case kWritingResponse: return POLLOUT;
 		case kClosing:         return 0;
 	}
@@ -46,13 +59,75 @@ short Connection::wantEvents() const
 bool                 Connection::isDone() const { return m_done; }
 Connection::State    Connection::state()  const { return m_state; }
 
+bool Connection::tryStartCgi(PollLoop &loop)
+{
+	if (m_router == NULL) return false;
+	const webserv::http::Request &req = m_parser.request();
+	RouteMatch m = m_router->match(m_origin, req);
+	if (m.errorStatus != 0 || m.server == NULL) return false;
+
+	std::string interp, script, scriptUri, pathInfo, workDir;
+	if (!handler::cgiMatch(m, interp, script, scriptUri, pathInfo, workDir)) {
+		return false;
+	}
+
+	std::vector<std::string> env = webserv::cgi::buildEnv(
+		req, m_origin, *m.server, script, scriptUri, pathInfo);
+
+	try {
+		// 5s runtime cap for now; feat/28 wires this to a config knob.
+		m_cgi = new webserv::cgi::CgiProcess(
+			interp, script, workDir, env, req.body, *this,
+			/*totalTimeoutMs*/  5000,
+			/*killEscalationMs*/ 200);
+		m_cgi->spawn(loop);
+	} catch (const webserv::Exception &e) {
+		LOG_WARN("cgi: spawn failed: " << e.what());
+		delete m_cgi;
+		m_cgi = NULL;
+		generateErrorResponse(502);
+		m_state = kWritingResponse;
+		return true;
+	}
+	m_state = kRunningCgi;
+	return true;
+}
+
+void Connection::onCgiComplete(int status, const std::string &stdoutData)
+{
+	const webserv::http::Request &req = m_parser.request();
+	webserv::http::Response r;
+	r.setKeepAlive(req.keepAlive);
+
+	if (status < 0) {
+		r.setStatus(504);
+		r.setContentType("text/plain; charset=utf-8");
+		r.setBody("504 Gateway Timeout\n");
+	} else if (status != 0 && stdoutData.empty()) {
+		r.setStatus(502);
+		r.setContentType("text/plain; charset=utf-8");
+		r.setBody("502 Bad Gateway\n");
+	} else {
+		handler::applyCgiOutput(stdoutData, r);
+	}
+	m_writeBuf = r.serialize();
+	m_writePos = 0;
+	m_state    = kWritingResponse;
+
+	// Free CgiProcess: safe here because its pipe handlers have already
+	// been queued for removal via PollLoop, and PollLoop's dispatcher
+	// only uses handler pointers as map keys (no dereference) between
+	// this point and drainPendingRemoves.
+	delete m_cgi;
+	m_cgi = NULL;
+}
+
 void Connection::generateStubResponse()
 {
 	const webserv::http::Request &req = m_parser.request();
 	webserv::http::Response       r;
 
 	if (m_router == NULL) {
-		// Legacy stub for --test-connection (no config loaded).
 		r.setStatus(200);
 		r.setKeepAlive(req.keepAlive);
 		r.setBody("webserv connection FSM skeleton\n");
@@ -156,11 +231,22 @@ void Connection::onReadable(PollLoop &loop)
 		         << (req.keepAlive ? " keep-alive" : " close")
 		         << (req.authority.empty() ? std::string() :
 		             (" host=" + req.authority)));
+		if (tryStartCgi(loop)) {
+			// CGI is running — response will be built when onCgiComplete
+			// fires and we'll pick up in kWritingResponse on the next
+			// tick. CgiProcess owns its own deadline.
+			loop.clearDeadline(this);
+			return;
+		}
 		generateStubResponse();
 		m_state = kWritingResponse;
+		loop.setDeadline(this, m_idleMs);
 		return;
 	}
-	loop.setDeadline(this, m_idleMs);
+	// NOTE: we intentionally do NOT refresh the deadline on each read.
+	// The deadline was set when the state entered kReadingRequest
+	// (at accept, or after a keep-alive reset). Refreshing here would
+	// let a slow-loris client dribble one byte a second forever.
 }
 
 void Connection::onWritable(PollLoop &loop)
@@ -180,7 +266,10 @@ void Connection::onWritable(PollLoop &loop)
 		m_writePos += static_cast<std::size_t>(w);
 	}
 	if (m_writePos < m_writeBuf.size()) {
-		loop.setDeadline(this, m_idleMs);
+		// Same reasoning as onReadable: the deadline set at state
+		// entry (kWritingResponse) covers the whole response write;
+		// per-write refresh would allow a "slow reader" client to
+		// tie up the connection indefinitely.
 		return;
 	}
 
@@ -222,6 +311,9 @@ void Connection::onWritable(PollLoop &loop)
 			m_state = kWritingResponse;
 		}
 	}
+	// Fresh deadline for the next state (kReadingRequest for the next
+	// pipelined request, or kWritingResponse for its response). One
+	// deadline per state entry, not per event.
 	loop.setDeadline(this, m_idleMs);
 }
 
