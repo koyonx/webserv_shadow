@@ -9,6 +9,7 @@
 #include "webserv/core/PollLoop.hpp"
 #include "webserv/cgi/CgiEnv.hpp"
 #include "webserv/net/Connection.hpp"
+#include "webserv/session/SessionManager.hpp"
 #include "webserv/net/ConnectionSpawner.hpp"
 #include "webserv/net/Listener.hpp"
 #include "webserv/net/Router.hpp"
@@ -252,6 +253,42 @@ static int runTestCgiEnv()
 	return 0;
 }
 
+// --------------------- --test-session ---------------------
+
+static int runTestSession()
+{
+	webserv::session::SessionManager mgr(2);  // 2-second TTL
+
+	webserv::session::SessionManager::Session &s1 = mgr.create();
+	s1.data["theme"]     = "dark";
+	s1.data["language"]  = "ja";
+	LOG_INFO("session created: " << s1.id
+	         << " (size=" << mgr.size() << ")");
+
+	const webserv::session::SessionManager::Session *found = mgr.find(s1.id);
+	if (found == NULL || found->data.find("theme")->second != "dark") {
+		LOG_ERROR("session lookup failed");
+		return 1;
+	}
+	LOG_INFO("session lookup ok: theme=" << found->data.find("theme")->second);
+
+	if (mgr.find("nonexistent-sid") != NULL) {
+		LOG_ERROR("nonexistent sid returned non-null");
+		return 1;
+	}
+	LOG_INFO("nonexistent sid correctly returned NULL");
+
+	LOG_INFO("waiting 3s for TTL expiry...");
+	::sleep(3);
+	mgr.sweep();
+	if (mgr.find(s1.id) != NULL) {
+		LOG_ERROR("expected session expired but still present");
+		return 1;
+	}
+	LOG_INFO("post-TTL: sessions=" << mgr.size() << " (expected 0)");
+	return mgr.size() == 0 ? 0 : 1;
+}
+
 // --------------------- --serve ---------------------
 
 int runServe(const std::string &confPath, long runMs)
@@ -328,6 +365,10 @@ int main(int argc, char **argv)
 	}
 	if (argc >= 2 && std::strcmp(argv[1], "--test-cgi-env") == 0) {
 		try { return runTestCgiEnv(); }
+		catch (const webserv::Exception &e) { LOG_ERROR(e.what()); return 1; }
+	}
+	if (argc >= 2 && std::strcmp(argv[1], "--test-session") == 0) {
+		try { return runTestSession(); }
 		catch (const webserv::Exception &e) { LOG_ERROR(e.what()); return 1; }
 	}
 	if (argc >= 2 && std::strcmp(argv[1], "--serve") == 0) {
