@@ -28,6 +28,8 @@ struct HeaderNameLess {
 
 typedef std::map<std::string, std::string, HeaderNameLess> HeaderMap;
 
+typedef std::map<std::string, std::string> CookieMap;
+
 // The parsed HTTP request. Fields are filled in progressively by the
 // RequestParser: request-line fields first, then headers, then body.
 struct Request {
@@ -49,6 +51,10 @@ struct Request {
 	bool        keepAlive;
 	std::size_t contentLength;
 	bool        chunked;
+
+	// -------- Cookies (filled by feat/24) --------
+	// Case-sensitive names per RFC 6265.
+	CookieMap   cookies;
 
 	Request();
 	void clear();

@@ -2,6 +2,7 @@
 #define WEBSERV_NET_CONNECTION_HPP
 
 #include "webserv/Fd.hpp"
+#include "webserv/cgi/CgiProcess.hpp"
 #include "webserv/config/Config.hpp"
 #include "webserv/core/IHandler.hpp"
 #include "webserv/http/RequestParser.hpp"
@@ -31,10 +32,11 @@ public:
 // and finishes. Real HTTP parsing lands in feat/10+ but is drop-in
 // against this same interface -- the state transitions and event
 // plumbing here won't change.
-class Connection : public IHandler {
+class Connection : public IHandler, public webserv::cgi::ICgiCallback {
 public:
 	enum State {
 		kReadingRequest,
+		kRunningCgi,
 		kWritingResponse,
 		kClosing
 	};
@@ -56,6 +58,9 @@ public:
 	bool  isDone() const;
 	State state()  const;
 
+	// ICgiCallback
+	virtual void onCgiComplete(int status, const std::string &stdoutData);
+
 private:
 	Connection(const Connection &);
 	Connection &operator=(const Connection &);
@@ -63,6 +68,10 @@ private:
 	void generateStubResponse();
 	void generateErrorResponse(int status);
 	void finish(PollLoop &loop);
+
+	// Attempt to route this request into CGI. Returns true if we
+	// started a CGI process and moved to kRunningCgi.
+	bool tryStartCgi(PollLoop &loop);
 
 	Fd                             m_fd;
 	webserv::config::Listen        m_origin;
@@ -76,6 +85,8 @@ private:
 	bool                           m_done;
 
 	webserv::http::RequestParser   m_parser;
+
+	webserv::cgi::CgiProcess      *m_cgi;   // owned during kRunningCgi
 };
 
 } // namespace webserv

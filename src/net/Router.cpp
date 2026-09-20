@@ -172,25 +172,50 @@ Router::matchLocation(const std::vector<webserv::config::LocationConfig> &locs,
 
 // -------- entry point --------
 
+static std::size_t maxInLocations(
+	const std::vector<webserv::config::LocationConfig> &locs)
+{
+	std::size_t best = 0;
+	for (std::size_t i = 0; i < locs.size(); ++i) {
+		if (locs[i].maxBodySize > best) best = locs[i].maxBodySize;
+		std::size_t nested = maxInLocations(locs[i].locations);
+		if (nested > best) best = nested;
+	}
+	return best;
+}
+
+std::size_t Router::maxBodyCap() const
+{
+	std::size_t best = 0;
+	for (std::size_t i = 0; i < m_cfg.servers.size(); ++i) {
+		const webserv::config::ServerConfig &s = m_cfg.servers[i];
+		if (s.maxBodySize > best) best = s.maxBodySize;
+		std::size_t nested = maxInLocations(s.locations);
+		if (nested > best) best = nested;
+	}
+	return (best > 0) ? best : (1024UL * 1024UL);
+}
+
 RouteMatch Router::match(const webserv::config::Listen &origin,
                          const webserv::http::Request  &req) const
 {
 	RouteMatch m;
+
+	// Server selection first, so error responses that fail path
+	// validation still know which server's error_page config applies.
+	std::string host = hostHeaderName(req.authority);
+	m.server = selectServer(origin, host);
+	if (m.server == NULL) {
+		m.errorStatus  = 404;
+		m.errorMessage = "no server matches the connection listener";
+		return m;
+	}
 
 	// Path normalization (with .. resolution).
 	std::string src = req.path.empty() ? std::string("/") : req.path;
 	if (!normalizePath(src, m.normalizedPath)) {
 		m.errorStatus  = 400;
 		m.errorMessage = "path escapes root after normalization";
-		return m;
-	}
-
-	// Host header selection.
-	std::string host = hostHeaderName(req.authority);
-	m.server = selectServer(origin, host);
-	if (m.server == NULL) {
-		m.errorStatus  = 404;
-		m.errorMessage = "no server matches the connection listener";
 		return m;
 	}
 
