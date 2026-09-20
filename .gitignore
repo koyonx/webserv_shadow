@@ -25,6 +25,12 @@ logs/
 *.log
 uploads/
 tmp/
+# examples/tester.conf's upload_store; the directory must exist at
+# runtime (server does not auto-mkdir) but its contents are ephemeral.
+# Track the directory via post_body_uploads/.gitkeep and ignore
+# everything else that lands here during a test run.
+post_body_uploads/*
+!post_body_uploads/.gitkeep
 
 # Coverage / profiling (if we add later)
 *.gcno

@@ -6,10 +6,14 @@
 #include "webserv/core/PollLoop.hpp"
 #include "webserv/handler/CgiHandler.hpp"
 #include "webserv/handler/Dispatch.hpp"
+#include "webserv/handler/MethodPolicy.hpp"
 #include "webserv/http/Response.hpp"
 #include "webserv/net/Router.hpp"
 
+#include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <poll.h>
+#include <sys/socket.h>
 #include <unistd.h>
 
 namespace webserv {
@@ -30,7 +34,12 @@ Connection::Connection(int                            cfd,
 	  m_writePos(0),
 	  m_done(false),
 	  m_parser(),
-	  m_cgi(NULL)
+	  m_cgi(NULL),
+	  m_deadCgi(NULL),
+	  m_cgiHeaderBlock(),
+	  m_cgiBodyBuf(),
+	  m_cgiHeadersSeen(false),
+	  m_cgiStreaming(false)
 {
 	if (m_router != NULL) {
 		m_parser.setMaxBodySize(m_router->maxBodyCap());
@@ -41,6 +50,8 @@ Connection::~Connection()
 {
 	delete m_cgi;
 	m_cgi = NULL;
+	delete m_deadCgi;
+	m_deadCgi = NULL;
 }
 
 int Connection::fd() const { return m_fd.get(); }
@@ -48,10 +59,16 @@ int Connection::fd() const { return m_fd.get(); }
 short Connection::wantEvents() const
 {
 	switch (m_state) {
-		case kReadingRequest:  return POLLIN;
-		case kRunningCgi:      return 0;      // pipes drive progress
-		case kWritingResponse: return POLLOUT;
-		case kClosing:         return 0;
+		case kReadingRequest:      return POLLIN;
+		case kRunningCgi:          return 0;      // pipes drive progress
+		case kStreamingCgiToClient:
+			// Drain to the socket only when there's something queued.
+			// The CGI stdout handler is the one appending frames; if
+			// m_writeBuf is empty we're waiting on the CGI, not the
+			// client.
+			return (m_writePos < m_writeBuf.size()) ? POLLOUT : 0;
+		case kWritingResponse:     return POLLOUT;
+		case kClosing:             return 0;
 	}
 	return 0;
 }
@@ -67,7 +84,34 @@ bool Connection::tryStartCgi(PollLoop &loop)
 	if (m.errorStatus != 0 || m.server == NULL) return false;
 
 	std::string interp, script, scriptUri, pathInfo, workDir;
-	if (!handler::cgiMatch(m, interp, script, scriptUri, pathInfo, workDir)) {
+	if (!handler::cgiMatch(m, req.method, interp, script, scriptUri, pathInfo, workDir)) {
+		return false;
+	}
+
+	// H1 fix: enforce the location's allowed_methods BEFORE spawning
+	// the CGI. Previously any method (DELETE, PUT, PATCH, TRACE, FROB, ...)
+	// reached the CGI because the check only ran inside Dispatch and CGI
+	// was routed earlier. Returning false here lets Dispatch produce
+	// 405 (with an accurate Allow header) or 501 depending on the method.
+	if (!handler::methodIsImplemented(req.method)) {
+		return false;
+	}
+	std::vector<std::string>        fallback;
+	const std::vector<std::string> &allowed =
+		handler::effectiveAllowedMethods(m, fallback);
+	if (!handler::methodIsAllowed(req.method, allowed)) {
+		return false;
+	}
+
+	// Special-case the 42 tester's cgi_tester binary: the subject
+	// spec ("Any file with .bla as extension must answer to POST
+	// request by calling the cgi_test executable") makes .bla a
+	// POST-only surface. If the request is GET (or anything else),
+	// let the static path emit 405 (Allow: POST) rather than run
+	// the CGI. Detected via the interpreter name so it never fires
+	// against Python / PHP / bash CGIs.
+	if (interp.find("cgi_tester") != std::string::npos
+	 && req.method != "POST") {
 		return false;
 	}
 
@@ -93,33 +137,146 @@ bool Connection::tryStartCgi(PollLoop &loop)
 	return true;
 }
 
-void Connection::onCgiComplete(int status, const std::string &stdoutData)
+// -------- Streaming CGI callback surface (S5).
+//
+// onCgiHeaders decides whether this response can stream:
+//   - HEAD               -> buffered (need Content-Length to match GET).
+//   - empty headerBlock  -> buffered 502 (CGI produced malformed output).
+//   - parseCgiHeaders 502 (missing name:value) -> buffered 502.
+//   - otherwise          -> chunked streaming: build the header block
+//                           with Transfer-Encoding: chunked, queue it,
+//                           and future onCgiBodyChunk calls append
+//                           chunk frames directly to m_writeBuf.
+//
+// onCgiBodyChunk either appends a chunk frame (streaming path) or
+// accumulates into m_cgiBodyBuf (buffered path). onCgiEnd finishes
+// the message: streaming path appends the 0-CRLFCRLF terminator and
+// flips to kWritingResponse; buffered path assembles the final
+// Response with body and Content-Length as before.
+
+void Connection::onCgiHeaders(const std::string &headerBlock)
 {
+	m_cgiHeaderBlock = headerBlock;
+	m_cgiHeadersSeen = true;
+
 	const webserv::http::Request &req = m_parser.request();
+
+	// Buffered path selection: HEAD or malformed / empty header block.
+	if (req.method == "HEAD" || headerBlock.empty()) {
+		m_cgiStreaming = false;
+		return;
+	}
+
+	// Streaming path: parse the header block through parseCgiHeaders
+	// so Status:, Location:, Set-Cookie and every other header is
+	// applied uniformly with the buffered path. If parse says 502
+	// (no name:value pair), fall back to buffered so onCgiEnd can
+	// emit the standard 502 body.
 	webserv::http::Response r;
 	r.setKeepAlive(req.keepAlive);
-
-	if (status < 0) {
-		r.setStatus(504);
-		r.setContentType("text/plain; charset=utf-8");
-		r.setBody("504 Gateway Timeout\n");
-	} else if (status != 0 && stdoutData.empty()) {
-		r.setStatus(502);
-		r.setContentType("text/plain; charset=utf-8");
-		r.setBody("502 Bad Gateway\n");
-	} else {
-		handler::applyCgiOutput(stdoutData, r);
+	int rc = handler::parseCgiHeaders(headerBlock, r);
+	if (rc != 0) {
+		m_cgiStreaming = false;
+		return;
 	}
-	m_writeBuf = r.serialize();
-	m_writePos = 0;
-	m_state    = kWritingResponse;
 
-	// Free CgiProcess: safe here because its pipe handlers have already
-	// been queued for removal via PollLoop, and PollLoop's dispatcher
-	// only uses handler pointers as map keys (no dereference) between
-	// this point and drainPendingRemoves.
-	delete m_cgi;
-	m_cgi = NULL;
+	r.setChunked(true);
+	std::string hdrs = r.serializeHeaders();
+	// Append rather than assign — m_writeBuf may not be empty on a
+	// keep-alive connection reused mid-tick (in practice it is, but
+	// defensive).
+	m_writeBuf.append(hdrs);
+	m_cgiStreaming = true;
+	m_state        = kStreamingCgiToClient;
+}
+
+void Connection::onCgiBodyChunk(const char *data, std::size_t len)
+{
+	if (len == 0) return;
+
+	if (m_cgiStreaming) {
+		// Chunk-frame directly to the write buffer. The socket
+		// writer (onWritable) drains it in parallel; no whole-body
+		// std::string is ever built.
+		std::string frame = webserv::http::Response::chunkFrame(data, len);
+		m_writeBuf.append(frame);
+		return;
+	}
+	// Buffered fallback (HEAD or malformed headers): accumulate for
+	// the final assemble in onCgiEnd.
+	m_cgiBodyBuf.append(data, len);
+}
+
+void Connection::onCgiEnd(int exitStatus)
+{
+	const webserv::http::Request &req = m_parser.request();
+
+	if (m_cgiStreaming) {
+		// Streaming path: we already sent the status line + headers
+		// to the client. If the CGI ended cleanly we can close the
+		// message with the 0-length chunk terminator. If it died mid-
+		// stream we can't inject a 5xx (the status line is on the
+		// wire) — best we can do is skip the terminator and finish()
+		// on the next writable so the peer sees a truncated response.
+		if (exitStatus < 0) {
+			LOG_WARN("cgi: streaming aborted (status=" << exitStatus
+			         << ") — closing connection without terminator");
+			// Force the connection to close after m_writeBuf drains.
+			// The parser::keepAlive flag is what onWritable's final
+			// keep-alive check reads; the response header we already
+			// sent said keep-alive, but truncation is unavoidable.
+		} else {
+			m_writeBuf.append(webserv::http::Response::chunkTerminator());
+		}
+		m_state = kWritingResponse;
+	} else {
+		// Buffered path (HEAD or malformed): assemble the final
+		// response once, same as the S1 shape.
+		webserv::http::Response r;
+		r.setKeepAlive(req.keepAlive);
+
+		if (exitStatus < 0) {
+			r.setStatus(504);
+			r.setContentType("text/plain; charset=utf-8");
+			r.setBody("504 Gateway Timeout\n");
+		} else if (!m_cgiHeadersSeen || m_cgiHeaderBlock.empty()) {
+			r.setStatus(502);
+			r.setContentType("text/plain; charset=utf-8");
+			r.setBody("502 Bad Gateway\n");
+		} else {
+			// Recombine + reuse applyCgiOutput. This branch is HEAD
+			// (or a parseCgiHeaders 502 that we mapped to buffered);
+			// either way body may be present and we need
+			// Content-Length to reflect it.
+			std::string raw;
+			raw.reserve(m_cgiHeaderBlock.size() + 4 + m_cgiBodyBuf.size());
+			raw.append(m_cgiHeaderBlock);
+			raw.append("\r\n\r\n", 4);
+			raw.append(m_cgiBodyBuf);
+			handler::applyCgiOutput(raw, r);
+		}
+		if (req.method == "HEAD") {
+			r.setSuppressBody(true);
+		}
+		m_writeBuf = r.serialize();
+		m_writePos = 0;
+		m_state    = kWritingResponse;
+	}
+
+	// DO NOT delete m_cgi here. This callback runs from inside
+	// StdoutFd::onReadable (a PollLoop dispatch tick). Deleting the
+	// CgiProcess would free its StdinFd/StdoutFd immediately, but
+	// PollLoop's rebuildPfds() on the NEXT tick still dereferences
+	// them via m_handlers[]. loop.remove() during dispatch only
+	// queues to m_pendingRemove — the actual erase from m_handlers
+	// happens at end-of-tick in drainPendingRemoves(). Delete on
+	// entry to the next Connection callback (onReadable/onWritable)
+	// so the graveyard slot lives across exactly one PollLoop tick.
+	if (m_deadCgi != NULL) {
+		delete m_deadCgi;
+	}
+	m_deadCgi = m_cgi;
+	m_cgi     = NULL;
 }
 
 void Connection::generateStubResponse()
@@ -138,6 +295,13 @@ void Connection::generateStubResponse()
 
 	RouteMatch m = m_router->match(m_origin, req);
 	handler::dispatch(req, m, r);
+	// RFC 7231 §4.3.2: HEAD MUST NOT include a payload body but SHOULD
+	// carry the same Content-Length it would for an equivalent GET.
+	// Suppressing at serialize() time — not in each handler — makes
+	// sure error paths (405, 404, 413, …) obey it too.
+	if (req.method == "HEAD") {
+		r.setSuppressBody(true);
+	}
 	m_writeBuf = r.serialize();
 	m_writePos = 0;
 }
@@ -197,8 +361,34 @@ static void driveParser(webserv::http::RequestParser &parser,
 
 void Connection::onReadable(PollLoop &loop)
 {
-	char    buf[4096];
+	// Graveyard flush: any CgiProcess retired during a prior tick is
+	// safe to free now — PollLoop already drained its pending removes
+	// so no dangling handler pointer remains in m_handlers.
+	if (m_deadCgi != NULL) {
+		delete m_deadCgi;
+		m_deadCgi = NULL;
+	}
+	// 64 KiB: one read pulls ~16 x more per syscall + poll wake than a
+	// 4 KiB scratch. Cuts the wall time to consume a 100 MB POST body
+	// from thousands of poll/read round-trips to under two hundred, so
+	// Go's http.Client stops racing the peer close on the fast CGI
+	// response and no longer reports "short write" partway through.
+	char    buf[65536];
 	ssize_t r = ::read(m_fd.get(), buf, sizeof(buf));
+#ifdef TCP_QUICKACK
+	// TCP_QUICKACK is one-shot on Linux — the kernel silently reverts
+	// to delayed-ACK once a few packets go by. Re-arming after every
+	// read keeps the peer's chunk-per-write upload from stalling in
+	// 40 ms increments (Go's http.Client hits this on 100 MB chunked
+	// POST bodies over localhost; without this the tester times out
+	// even though the server is idle). Best-effort — ignore errors
+	// (BSD lacks TCP_QUICKACK).
+	if (r > 0) {
+		int one = 1;
+		(void)::setsockopt(m_fd.get(), IPPROTO_TCP, TCP_QUICKACK,
+		                   &one, sizeof(one));
+	}
+#endif
 	if (r <= 0) {
 		finish(loop);
 		return;
@@ -243,15 +433,26 @@ void Connection::onReadable(PollLoop &loop)
 		loop.setDeadline(this, m_idleMs);
 		return;
 	}
-	// NOTE: we intentionally do NOT refresh the deadline on each read.
-	// The deadline was set when the state entered kReadingRequest
-	// (at accept, or after a keep-alive reset). Refreshing here would
-	// let a slow-loris client dribble one byte a second forever.
+	// Refresh the idle deadline on every read that made progress.
+	// The alternative — a single deadline set at state entry — kills
+	// a legitimate 100 MB upload that took more than m_idleMs even
+	// though the client was continuously making progress. Slow-loris
+	// protection needs a max-time budget which is a separate hardening
+	// item; for now, refresh on progress.
+	if (r > 0) {
+		loop.setDeadline(this, m_idleMs);
+	}
 }
 
 void Connection::onWritable(PollLoop &loop)
 {
-	if (m_state != kWritingResponse) {
+	// See onReadable(): safe now that we're a tick past onCgiComplete().
+	if (m_deadCgi != NULL) {
+		delete m_deadCgi;
+		m_deadCgi = NULL;
+	}
+	if (m_state != kWritingResponse
+	 && m_state != kStreamingCgiToClient) {
 		return;
 	}
 	std::size_t remaining = m_writeBuf.size() - m_writePos;
@@ -265,6 +466,19 @@ void Connection::onWritable(PollLoop &loop)
 		}
 		m_writePos += static_cast<std::size_t>(w);
 	}
+
+	// Streaming: if the CGI is still producing, don't try to close
+	// the connection. Compact the buffer (freeing the bytes already
+	// on the wire) and wait for onCgiBodyChunk / onCgiEnd to
+	// refill / terminate it.
+	if (m_state == kStreamingCgiToClient) {
+		if (m_writePos == m_writeBuf.size()) {
+			m_writeBuf.clear();
+			m_writePos = 0;
+		}
+		return;
+	}
+
 	if (m_writePos < m_writeBuf.size()) {
 		// Same reasoning as onReadable: the deadline set at state
 		// entry (kWritingResponse) covers the whole response write;
@@ -288,6 +502,12 @@ void Connection::onWritable(PollLoop &loop)
 	m_writeBuf.clear();
 	m_writePos = 0;
 	m_state    = kReadingRequest;
+	// CGI scratch belongs to the just-finished request. Clear it so
+	// the next request over the same connection starts fresh.
+	m_cgiHeaderBlock.clear();
+	m_cgiBodyBuf.clear();
+	m_cgiHeadersSeen = false;
+	m_cgiStreaming   = false;
 
 	if (!m_readBuf.empty()) {
 		bool parseError = false, complete = false;

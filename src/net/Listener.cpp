@@ -9,6 +9,7 @@
 #include <cstring>
 #include <netdb.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <poll.h>
 #include <sys/socket.h>
 #include <sys/types.h>
@@ -120,6 +121,28 @@ void Listener::onReadable(PollLoop &loop)
 			         << " (" << e.what() << "), closing");
 			::close(cfd);
 			continue;
+		}
+		// TCP_NODELAY + TCP_QUICKACK: disable Nagle's algorithm AND
+		// delayed-ACK on accepted sockets. HTTP/1.1 requests over
+		// localhost stall for minutes without both: Go's http.Client
+		// writes body bytes in chunk-sized bursts, Nagle waits for
+		// more before flushing them, our kernel delays the ACK
+		// waiting to piggyback on a reply — the 100 MB chunked
+		// upload from ./testers/tester then times out at 30 s
+		// ("short write") even though CPU load is idle. Not fatal
+		// if the sockopts aren't available (BSD only has NODELAY).
+		{
+			int one = 1;
+			if (::setsockopt(cfd, IPPROTO_TCP, TCP_NODELAY,
+			                 &one, sizeof(one)) < 0) {
+				LOG_WARN("Listener: TCP_NODELAY failed on cfd=" << cfd);
+			}
+#ifdef TCP_QUICKACK
+			if (::setsockopt(cfd, IPPROTO_TCP, TCP_QUICKACK,
+			                 &one, sizeof(one)) < 0) {
+				LOG_WARN("Listener: TCP_QUICKACK failed on cfd=" << cfd);
+			}
+#endif
 		}
 		m_sink.onAccept(cfd, m_cfg, loop);
 	}

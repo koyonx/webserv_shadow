@@ -49,8 +49,19 @@ public:
 	// Case-insensitive prefix match with a "/" boundary check.
 	// prefix == "/" matches every path. Otherwise the request path
 	// must equal prefix or start with prefix + "/".
+	// Special: `/dir/` also matches the exact path `/dir` so the
+	// handler can emit a 301 that adds the trailing slash.
 	static bool locationPrefixMatches(const std::string &prefix,
 	                                  const std::string &path);
+
+	// Strip the location's declared prefix off `path` and return the
+	// remainder ("/", "/foo", "/foo/bar", ...), suitable to join with
+	// the location's `root`. This implements the subject's mapping
+	// example: URL /kapouet rooted at /tmp/www serves
+	// /kapouet/pouic/toto/pouet from /tmp/www/pouic/toto/pouet
+	// (prefix-stripped, not prefix-appended).
+	static std::string stripLocationPrefix(const std::string &locationPath,
+	                                       const std::string &normalizedPath);
 
 private:
 	const webserv::config::Config &m_cfg;

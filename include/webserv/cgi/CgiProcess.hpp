@@ -12,14 +12,30 @@
 namespace webserv {
 namespace cgi {
 
-// Callback invoked once the CGI process has finished:
-//   status = WEXITSTATUS(status) if the process exited normally,
-//          = -1 if the process was killed or failed to launch.
-// stdoutData is the raw bytes read from the child's stdout.
+// Streaming-friendly CGI callback interface (RFC 3875 §6).
+//
+// The three methods fire in order:
+//   onCgiHeaders(header_block)  — exactly once, when the CGI has
+//     produced its blank-line terminator (or a fatal early EOF /
+//     header-cap error, in which case header_block is empty and
+//     Connection must emit its own 502).
+//   onCgiBodyChunk(data, len)   — zero-or-more times, as stdout
+//     bytes arrive after the header block. Body may be empty.
+//   onCgiEnd(exit_status)       — exactly once, when the child is
+//     reaped. exit_status = WEXITSTATUS on normal exit, -1 on
+//     kill/timeout/exec failure.
+//
+// The interface is designed so an implementation can commit to
+// streaming (chunked response) at onCgiHeaders time and no longer
+// need to buffer the CGI's body — critical for the 100 MB × N
+// concurrent POST scenario. A trivially-buffering implementation is
+// also fine (accumulate chunks, apply at end).
 class ICgiCallback {
 public:
 	virtual ~ICgiCallback() {}
-	virtual void onCgiComplete(int status, const std::string &stdoutData) = 0;
+	virtual void onCgiHeaders(const std::string &headerBlock)         = 0;
+	virtual void onCgiBodyChunk(const char *data, std::size_t len)    = 0;
+	virtual void onCgiEnd(int exitStatus)                             = 0;
 };
 
 // A running CGI process:
@@ -103,7 +119,15 @@ private:
 	std::vector<std::string>  m_env;
 	std::string               m_body;
 	std::size_t               m_bodyPos;
-	std::string               m_output;
+	// Header pre-buffer. Once the \r\n\r\n terminator is spotted we
+	// fire onCgiHeaders and stop accumulating — subsequent stdout
+	// reads flow straight through to onCgiBodyChunk. Capped so a
+	// runaway CGI that emits headers forever can't OOM the server.
+	std::string               m_headerBuf;
+	bool                      m_headersFired;
+	bool                      m_headerMalformed;
+	std::size_t               m_headerCapBytes;
+	std::size_t               m_bodyStreamedBytes;
 
 	pid_t                     m_pid;
 	ICgiCallback             &m_cb;
