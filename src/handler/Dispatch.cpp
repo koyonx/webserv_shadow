@@ -3,6 +3,7 @@
 #include "webserv/StringUtil.hpp"
 #include "webserv/handler/DeleteHandler.hpp"
 #include "webserv/handler/ErrorPage.hpp"
+#include "webserv/handler/PostHandler.hpp"
 #include "webserv/handler/StaticHandler.hpp"
 
 namespace webserv {
@@ -69,6 +70,17 @@ void dispatch(const webserv::http::Request &req,
 		return;
 	}
 
+	// Location-specific client_max_body_size enforcement. Parser cap
+	// is the largest across the config (so legitimate uploads reach
+	// this point); the per-location cap is stricter.
+	std::size_t bodyMax = (match.location != NULL)
+	                    ? match.location->maxBodySize
+	                    : match.server->maxBodySize;
+	if (bodyMax > 0 && req.body.size() > bodyMax) {
+		emitError(413, &match, response);
+		return;
+	}
+
 	// `return CODE [URL];` short-circuits everything else.
 	if (match.location != NULL && match.location->hasReturn) {
 		int code = match.location->ret.code;
@@ -94,8 +106,7 @@ void dispatch(const webserv::http::Request &req,
 		return;
 	}
 	if (req.method == "POST") {
-		// feat/19 lands the real POST handler; until then, 501.
-		emitError(501, &match, response);
+		servePost(req, match, response);
 		return;
 	}
 	emitError(501, &match, response);
