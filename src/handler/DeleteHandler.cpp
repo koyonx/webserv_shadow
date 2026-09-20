@@ -2,6 +2,7 @@
 
 #include "webserv/Log.hpp"
 #include "webserv/handler/ErrorPage.hpp"
+#include "webserv/net/Router.hpp"
 
 #include <cerrno>
 #include <sys/stat.h>
@@ -40,7 +41,13 @@ void serveDelete(const webserv::http::Request &req,
 		emitError(500, &match, response);
 		return;
 	}
-	std::string fsPath = joinPath(root, match.normalizedPath);
+	// Subject-correct root: strip location prefix before joining.
+	const std::string &locPath = (match.location != NULL)
+	                             ? match.location->path
+	                             : std::string("/");
+	std::string relPath = webserv::Router::stripLocationPrefix(
+		locPath, match.normalizedPath);
+	std::string fsPath = joinPath(root, relPath);
 
 	struct stat st;
 	if (::stat(fsPath.c_str(), &st) < 0) {

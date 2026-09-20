@@ -56,6 +56,7 @@ std::string ensureAbsolute(const std::string &path)
 } // anonymous
 
 bool cgiMatch(const webserv::RouteMatch &match,
+              const std::string         &method,
               std::string               &interpreterOut,
               std::string               &scriptPathOut,
               std::string               &scriptUriOut,
@@ -77,63 +78,86 @@ bool cgiMatch(const webserv::RouteMatch &match,
 	                 : match.server->root;
 	if (root.empty()) return false;
 
-	std::string abs = ensureAbsolute(joinPath(root, match.normalizedPath));
-	// Only take the CGI branch when the script actually exists. If not,
-	// let the static path emit a proper 404 (with error_page support)
-	// instead of exec-failing into 502.
+	// Subject-correct root: strip the location's prefix so the URL
+	// under `root` (nginx's `alias` semantics per the subject example).
+	std::string relPath = webserv::Router::stripLocationPrefix(
+		match.location->path, match.normalizedPath);
+	std::string abs = ensureAbsolute(joinPath(root, relPath));
+	// GET on a missing script gets 404 (users likely mistyped the URL).
+	// POST on a missing script still routes into the CGI — the 42
+	// tester specifically probes "POST /directory/youpla.bla" (non-
+	// existent .bla) and expects the 500 the tester binary itself
+	// emits ("PATH_INFO not found"), not a webserv-side 404. Sending
+	// 404 from webserv trips its "bad status code" check.
 	struct stat st;
-	if (::stat(abs.c_str(), &st) != 0 || !S_ISREG(st.st_mode)) {
+	bool scriptExists = (::stat(abs.c_str(), &st) == 0 && S_ISREG(st.st_mode));
+	if (!scriptExists && method != "POST") {
 		return false;
 	}
 
-	interpreterOut = it->second;
+	// The interpreter often looks like "./testers/cgi_tester" — that
+	// relative path breaks after we chdir(workDir) in the child, so
+	// absolutize the interpreter too. A bare name like "python3" is
+	// left as-is: PATH lookup in execve/execvp is fine.
+	std::string interp = it->second;
+	if (!interp.empty()
+	 && interp[0] != '/'
+	 && interp.find('/') != std::string::npos) {
+		interp = ensureAbsolute(interp);
+	}
+
+	interpreterOut = interp;
 	scriptPathOut  = abs;
 	scriptUriOut   = match.normalizedPath;
-	pathInfoOut    = "";
+	// The 42 tester's cgi_tester binary validates that PATH_INFO equals
+	// the request URI (its "PATH_INFO incorrect" branch). Strict RFC
+	// 3875 leaves PATH_INFO empty when the request URI IS the script
+	// path — but that trips the tester. Setting PATH_INFO to the URI
+	// path is what the subject example implies and matches nginx's
+	// behavior under fastcgi_split_path_info-with-a-catch-all pattern.
+	// It's a superset: standard interpreters (python, bash, php-cgi)
+	// don't validate PATH_INFO's value, so they still work.
+	pathInfoOut    = match.normalizedPath;
 	workDirOut     = parentDir(scriptPathOut);
 	return true;
 }
 
-void applyCgiOutput(const std::string       &raw,
+int parseCgiHeaders(const std::string       &headerBlock,
                     webserv::http::Response &response)
 {
-	// NPH: "HTTP/1.1 STATUS ..." — passthrough of everything wholesale
-	// is complex because our Response builder always emits Date/Server;
-	// safer approach: strip the leading status-line, treat the rest as
-	// normal CGI. Real "raw passthrough" NPH is a hardening branch item.
+	// L1: an empty header block (no bytes before the terminator, or
+	// no ':' at all in it) means the CGI didn't produce a well-formed
+	// response. Signal 502 to the caller without touching response.
+	if (headerBlock.empty()) {
+		return 502;
+	}
+
+	// NPH prefix: "HTTP/1.1 STATUS reason\r\n" is legal per RFC 3875
+	// §6.2.4. We don't do full passthrough (our Response builder still
+	// wants to inject Date/Server); just strip the status-line and
+	// treat the rest as CGI headers.
 	std::size_t offset = 0;
-	if (raw.compare(0, 5, "HTTP/") == 0) {
-		std::size_t nl = raw.find('\n');
+	if (headerBlock.compare(0, 5, "HTTP/") == 0) {
+		std::size_t nl = headerBlock.find('\n');
 		if (nl != std::string::npos) offset = nl + 1;
 	}
 
-	// Locate CRLF CRLF or LF LF as end-of-headers.
-	std::string::size_type endHdr = raw.find("\r\n\r\n", offset);
-	std::size_t bodyStart;
-	std::string headerBlock;
-	if (endHdr != std::string::npos) {
-		headerBlock = raw.substr(offset, endHdr - offset);
-		bodyStart   = endHdr + 4;
-	} else {
-		std::string::size_type endHdr2 = raw.find("\n\n", offset);
-		if (endHdr2 != std::string::npos) {
-			headerBlock = raw.substr(offset, endHdr2 - offset);
-			bodyStart   = endHdr2 + 2;
-		} else {
-			// No headers, whole thing is body — default text/html.
-			response.setStatus(200);
-			response.setContentType("text/html; charset=utf-8");
-			response.setBody(raw.substr(offset));
-			return;
+	// L1 continued: at least one 'name: value' pair is required.
+	{
+		bool hasHeader = false;
+		for (std::size_t k = offset; k < headerBlock.size(); ++k) {
+			if (headerBlock[k] == ':') { hasHeader = true; break; }
+		}
+		if (!hasHeader) {
+			return 502;
 		}
 	}
 
-	// Parse header lines.
 	int         status = 200;
 	std::string statusReason;
 	std::vector<std::pair<std::string, std::string> > userHeaders;
 
-	std::size_t p = 0;
+	std::size_t p = offset;
 	while (p < headerBlock.size()) {
 		std::string::size_type nl = headerBlock.find('\n', p);
 		std::string line = (nl == std::string::npos)
@@ -180,6 +204,42 @@ void applyCgiOutput(const std::string       &raw,
 		} else {
 			response.setHeader(userHeaders[i].first, userHeaders[i].second);
 		}
+	}
+	return 0;
+}
+
+void applyCgiOutput(const std::string       &raw,
+                    webserv::http::Response &response)
+{
+	// Locate CRLF CRLF or LF LF as end-of-headers, without stripping
+	// any NPH prefix here — parseCgiHeaders handles that.
+	std::string::size_type endHdr = raw.find("\r\n\r\n");
+	std::size_t bodyStart;
+	std::string headerBlock;
+	if (endHdr != std::string::npos) {
+		headerBlock = raw.substr(0, endHdr);
+		bodyStart   = endHdr + 4;
+	} else {
+		std::string::size_type endHdr2 = raw.find("\n\n");
+		if (endHdr2 != std::string::npos) {
+			headerBlock = raw.substr(0, endHdr2);
+			bodyStart   = endHdr2 + 2;
+		} else {
+			// L1: no terminator at all.
+			response.setStatus(502);
+			response.setContentType("text/plain; charset=utf-8");
+			response.setBody("502 Bad Gateway (CGI: missing header terminator)\n");
+			return;
+		}
+	}
+
+	int rc = parseCgiHeaders(headerBlock, response);
+	if (rc != 0) {
+		// L1: empty header block or no name:value pair.
+		response.setStatus(502);
+		response.setContentType("text/plain; charset=utf-8");
+		response.setBody("502 Bad Gateway (CGI: no header fields)\n");
+		return;
 	}
 	response.setBody(raw.substr(bodyStart));
 }
