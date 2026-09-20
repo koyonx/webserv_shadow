@@ -39,7 +39,9 @@ public:
 	           const std::string              &scriptWorkDir,
 	           const std::vector<std::string> &env,
 	           const std::string              &body,
-	           ICgiCallback                   &cb);
+	           ICgiCallback                   &cb,
+	           long                            totalTimeoutMs = 30000,
+	           long                            killEscalationMs = 100);
 	~CgiProcess();
 
 	// Spawn the child and register the pipe fds with the loop.
@@ -56,6 +58,7 @@ public:
 	// Called by the internal pipe handlers.
 	void  onStdinReady(PollLoop &loop);
 	void  onStdoutReady(PollLoop &loop);
+	void  onDeadlineExpired(PollLoop &loop);
 
 private:
 	CgiProcess(const CgiProcess &);
@@ -110,6 +113,10 @@ private:
 	bool                      m_stdinClosed;
 	bool                      m_stdoutClosed;
 	bool                      m_finished;
+
+	long                      m_totalTimeoutMs;
+	long                      m_killEscalationMs;
+	int                       m_killState;    // 0=alive, 1=SIGTERM, 2=SIGKILL
 };
 
 } // namespace cgi
