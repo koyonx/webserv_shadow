@@ -53,7 +53,8 @@ Request::Request()
 	  body(),
 	  keepAlive(false),
 	  contentLength(0),
-	  chunked(false)
+	  chunked(false),
+	  cookies()
 {}
 
 void Request::clear()
@@ -69,6 +70,7 @@ void Request::clear()
 	keepAlive     = false;
 	contentLength = 0;
 	chunked       = false;
+	cookies.clear();
 }
 
 } // namespace http
